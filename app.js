@@ -44,6 +44,47 @@ const save = {
   apiKey() { DB.set('apiKey', state.apiKey); },
 };
 
+/* ── MEDIA SESSION + BACKGROUND AUDIO KEEPALIVE ── */
+// A silent 1-second audio loop keeps iOS from suspending the audio session
+// when the screen turns off, allowing the YT IFrame audio to continue.
+let _silentAudio = null;
+function ensureSilentAudio() {
+  if (_silentAudio) return;
+  // 1-second silent MP3 as a data URI
+  const SILENT_MP3 = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjIwLjEwMAAAAAAAAAAAAAAA//tUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAACAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU4LjM1AAAAAAAAAAAAAAAAJAAAAAAAAAAAIAplHAAAAA==';
+  _silentAudio = new Audio(SILENT_MP3);
+  _silentAudio.loop = true;
+  _silentAudio.volume = 0.001; // effectively silent but non-zero keeps the session
+}
+
+function startSilentAudio() {
+  ensureSilentAudio();
+  _silentAudio.play().catch(() => {}); // may fail before user gesture — that's fine
+}
+
+function stopSilentAudio() {
+  if (_silentAudio) _silentAudio.pause();
+}
+
+function setupMediaSession(track) {
+  if (!('mediaSession' in navigator)) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title:  track.title,
+    artist: track.artist,
+    album:  'Aspotï',
+    artwork: track.thumb ? [{ src: track.thumb, sizes: '320x180', type: 'image/jpeg' }] : [],
+  });
+  navigator.mediaSession.setActionHandler('play',          () => { YT_PLAYER?.playVideo(); });
+  navigator.mediaSession.setActionHandler('pause',         () => { YT_PLAYER?.pauseVideo(); });
+  navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
+  navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
+  navigator.mediaSession.setActionHandler('seekto', e => {
+    if (YT_PLAYER && state.currentDuration) {
+      YT_PLAYER.seekTo(e.seekTime, true);
+    }
+  });
+}
+
 /* ── YOUTUBE IFrame API ── */
 let YT_PLAYER = null;
 let YT_READY_CB = null;
@@ -84,6 +125,8 @@ function playTrack(track, queueOverride, idx) {
   updateNowPlaying(track);
   updateMiniPlayer(track);
   updateArtColor(track.thumb);
+  resetProgressUI();
+  setupMediaSession(track);
 
   const doPlay = () => {
     YT_PLAYER.loadVideoById(track.videoId);
@@ -134,6 +177,8 @@ function onPlay() {
   artContainer.classList.add('playing');
   artContainer.classList.remove('paused');
   startProgressLoop();
+  startSilentAudio();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
 }
 
 function onPause() {
@@ -141,6 +186,8 @@ function onPause() {
   updatePlayIcons(false);
   artContainer.classList.remove('playing');
   artContainer.classList.add('paused');
+  stopSilentAudio();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
 }
 
 function onEnded() {
@@ -158,14 +205,24 @@ function startProgressLoop() {
     const dur = YT_PLAYER.getDuration() || 0;
     state.currentDuration = dur;
     const pct = dur ? (cur / dur) * 100 : 0;
-    const slider = el('np-progress');
-    slider.value = pct;
-    slider.style.setProperty('--pct', pct + '%');
-    el('np-current').textContent = fmtTime(cur);
-    el('np-duration').textContent = fmtTime(dur);
+    updateProgressUI(pct, cur, dur);
     progressRAF = requestAnimationFrame(tick);
   }
   progressRAF = requestAnimationFrame(tick);
+}
+
+function updateProgressUI(pct, cur, dur) {
+  const slider = el('np-progress');
+  if (!slider) return;
+  slider.value = pct;
+  // Keep --pct at least 0.01% so WebKit always renders the filled track + thumb
+  slider.style.setProperty('--pct', Math.max(pct, 0.01) + '%');
+  el('np-current').textContent = fmtTime(cur);
+  el('np-duration').textContent = fmtTime(dur);
+}
+
+function resetProgressUI() {
+  updateProgressUI(0.01, 0, 0);
 }
 
 /* ── HISTORY ── */
@@ -316,17 +373,21 @@ function updateMiniPlayer(track) {
 }
 
 function updatePlayIcons(playing) {
-  const playPath = el('pp-path');
-  if (playing) {
-    playPath.setAttribute('d', 'M16 18h4V6h-4zM8 18h4V6H8z');
-  } else {
-    playPath.setAttribute('d', 'M22 18v-12l-18 6z');
+  // Now-playing sheet: toggle between the two SVGs (#pp-play / #pp-pause)
+  const ppPlay  = el('pp-play');
+  const ppPause = el('pp-pause');
+  if (ppPlay && ppPause) {
+    ppPlay.style.display  = playing ? 'none'  : '';
+    ppPause.style.display = playing ? ''      : 'none';
   }
+  // Mini player
   const miniIcon = el('mini-play-icon');
-  if (playing) {
-    miniIcon.innerHTML = '<path d="M6 19h4V5H6zm8-14v14h4V5z"/>';
-  } else {
-    miniIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+  if (miniIcon) {
+    if (playing) {
+      miniIcon.innerHTML = '<path d="M6 19h4V5H6zm8-14v14h4V5z"/>';
+    } else {
+      miniIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+    }
   }
 }
 
