@@ -47,47 +47,44 @@ const save = {
    NATIVE AUDIO ENGINE
    Uses a real <audio> element so iOS keeps playing in
    the background / with screen off — iframes can't do this.
-   Audio URL is resolved via Cobalt (cobalt.tools), a
-   free open-source media extraction API.
+   Audio URL is resolved via Piped public instances —
+   open-source YouTube proxies with no key required.
+   Falls back through multiple instances automatically.
    ════════════════════════════════════════════════════ */
 
 const AUDIO = new Audio();
 AUDIO.preload = 'auto';
 
-// Cobalt instances to try in order (public instances, no key needed)
-const COBALT_INSTANCES = [
-  'https://co.wuk.sh',
-  'https://cobalt.api.thevern.xyz',
-  'https://cobalt.rintsi.com',
+// Public Piped API instances — tried in order until one works.
+// These return direct YouTube CDN audio stream URLs.
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://piped-api.garudalinux.org',
+  'https://api.piped.yt',
+  'https://piped.syncrea.eu',
+  'https://piped.drgns.space',
 ];
 
 async function resolveAudioUrl(videoId) {
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  for (const base of COBALT_INSTANCES) {
+  for (const base of PIPED_INSTANCES) {
     try {
-      const res = await fetch(`${base}/api/json`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({
-          url: ytUrl,
-          vCodec: 'h264',
-          vQuality: '144',   // lowest video quality — we only want audio
-          aFormat: 'mp3',
-          isAudioOnly: true, // ← key flag: audio-only stream
-          disableMetadata: true,
-        }),
-        signal: AbortSignal.timeout(8000),
+      const res = await fetch(`${base}/streams/${videoId}`, {
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(9000),
       });
       if (!res.ok) continue;
       const data = await res.json();
-      // Cobalt returns { status: 'stream'|'redirect'|'picker', url: '...' }
-      if ((data.status === 'stream' || data.status === 'redirect') && data.url) {
-        return data.url;
+
+      // data.audioStreams is an array of { url, bitrate, mimeType, ... }
+      const streams = (data.audioStreams || [])
+        .filter(s => s.url && s.mimeType && s.mimeType.includes('audio'))
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+      if (streams.length > 0) {
+        return streams[0].url;
       }
-      // Some instances return status 'tunnel'
-      if (data.status === 'tunnel' && data.url) return data.url;
     } catch {
-      // Try next instance
+      // Instance unreachable or timed out — try next
     }
   }
   return null;
