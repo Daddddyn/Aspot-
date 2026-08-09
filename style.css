@@ -646,7 +646,6 @@ img { display: block; object-fit: cover; }
   border-radius: 2px;
   margin-bottom: 6px;
 }
-/* Always show the thumb, even at position 0 */
 .progress-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 14px; height: 14px;
@@ -654,7 +653,7 @@ img { display: block; object-fit: cover; }
   background: #fff;
   box-shadow: 0 1px 4px rgba(0,0,0,.4);
   cursor: pointer;
-  margin-top: -5px; /* vertically center on the 4px track */
+  margin-top: -5px;
 }
 .progress-slider::-webkit-slider-runnable-track {
   height: 4px;
@@ -836,13 +835,8 @@ img { display: block; object-fit: cover; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.hidden { display: none; }
 
-/* ── YT CONTAINER ── */
-#yt-container {
-  position: fixed;
-  top: -9999px; left: -9999px;
-  width: 1px; height: 1px;
-  pointer-events: none;
-}
+/* ── SPINNER ── */
+@keyframes spin-pp { to { transform: rotate(360deg); } }
 
 /* ── LIKED HEART STATE ── */
 .liked-heart path { transition: fill .2s, stroke .2s; }
