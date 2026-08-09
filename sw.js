@@ -1,7 +1,7 @@
 /* Aspotï Service Worker */
 const CACHE = 'aspoti-v1';
 const ASSETS = [
-  '/Aspot-',
+  '/Aspot-/',
   '/index.html',
   '/style.css',
   '/app.js',
