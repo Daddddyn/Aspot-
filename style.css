@@ -632,7 +632,7 @@ img { display: block; object-fit: cover; }
   outline: none;
   cursor: pointer;
 }
-.progress-slider::-webkit-slider-thumb, .volume-slider::-webkit-slider-thumb {
+.volume-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 14px; height: 14px;
   border-radius: 50%;
@@ -641,10 +641,24 @@ img { display: block; object-fit: cover; }
   cursor: pointer;
 }
 .progress-slider {
-  background: linear-gradient(to right, #fff var(--pct, 0%), rgba(255,255,255,.2) var(--pct, 0%));
+  background: linear-gradient(to right, #fff var(--pct, 0.01%), rgba(255,255,255,.2) var(--pct, 0.01%));
   height: 4px;
   border-radius: 2px;
   margin-bottom: 6px;
+}
+/* Always show the thumb, even at position 0 */
+.progress-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  cursor: pointer;
+  margin-top: -5px; /* vertically center on the 4px track */
+}
+.progress-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
 }
 .np-times {
   display: flex; justify-content: space-between;
