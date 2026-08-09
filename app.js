@@ -16,7 +16,7 @@ const DB = {
 
 /* ── STATE ── */
 const state = {
-  apiKey: 'YOUR_API_KEY_HERE', // YouTube Data API v3 key for search
+  apiKey: 'AIzaSyBgibbTvE7Khph08tK5BlVOjZ3DGk_nTYk',
   playlists:        DB.get('playlists', []),
   liked:            DB.get('liked', []),
   history:          DB.get('history', []),
