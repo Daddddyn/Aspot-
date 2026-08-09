@@ -18,134 +18,135 @@ const DB = {
 
 /* ── STATE ── */
 const state = {
-  apiKey: 'AIzaSyBgibbTvE7Khph08tK5BlVOjZ3DGk_nTYk', // ← paste your YouTube Data API v3 key here
-  playlists: DB.get('playlists', []),          // [{id, name, tracks:[]}]
-  liked: DB.get('liked', []),                  // [track]
-  history: DB.get('history', []),              // [track]
-  queue: [],                                   // current play queue
+  apiKey: 'AIzaSyBgibbTvE7Khph08tK5BlVOjZ3DGk_nTYk',
+  playlists: DB.get('playlists', []),
+  liked: DB.get('liked', []),
+  history: DB.get('history', []),
+  queue: [],
   queueIdx: -1,
   shuffle: false,
-  repeat: 'none',                              // 'none' | 'all' | 'one'
-  playerReady: false,
+  repeat: 'none',       // 'none' | 'all' | 'one'
   playing: false,
   currentTrack: null,
   currentDuration: 0,
   volumeLevel: DB.get('volume', 80),
   bgAudio: DB.get('bgAudio', true),
-  currentPlaylistId: null,                     // for playlist detail view
+  currentPlaylistId: null,
+  loading: false,
 };
 
 /* ── SAVE helpers ── */
 const save = {
   playlists() { DB.set('playlists', state.playlists); },
-  liked() { DB.set('liked', state.liked); },
-  history() { DB.set('history', state.history); },
-  volume() { DB.set('volume', state.volumeLevel); },
-  apiKey() { DB.set('apiKey', state.apiKey); },
+  liked()     { DB.set('liked',     state.liked);     },
+  history()   { DB.set('history',   state.history);   },
+  volume()    { DB.set('volume',    state.volumeLevel); },
 };
 
-/* ── MEDIA SESSION + BACKGROUND AUDIO KEEPALIVE ── */
-// A silent 1-second audio loop keeps iOS from suspending the audio session
-// when the screen turns off, allowing the YT IFrame audio to continue.
-let _silentAudio = null;
-function ensureSilentAudio() {
-  if (_silentAudio) return;
-  // 1-second silent MP3 as a data URI
-  const SILENT_MP3 = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjIwLjEwMAAAAAAAAAAAAAAA//tUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAACAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU4LjM1AAAAAAAAAAAAAAAAJAAAAAAAAAAAIAplHAAAAA==';
-  _silentAudio = new Audio(SILENT_MP3);
-  _silentAudio.loop = true;
-  _silentAudio.volume = 0.001; // effectively silent but non-zero keeps the session
-}
+/* ════════════════════════════════════════════════════
+   NATIVE AUDIO ENGINE
+   Uses a real <audio> element so iOS keeps playing in
+   the background / with screen off — iframes can't do this.
+   Audio URL is resolved via Cobalt (cobalt.tools), a
+   free open-source media extraction API.
+   ════════════════════════════════════════════════════ */
 
-function startSilentAudio() {
-  ensureSilentAudio();
-  _silentAudio.play().catch(() => {}); // may fail before user gesture — that's fine
-}
+const AUDIO = new Audio();
+AUDIO.preload = 'auto';
 
-function stopSilentAudio() {
-  if (_silentAudio) _silentAudio.pause();
-}
+// Cobalt instances to try in order (public instances, no key needed)
+const COBALT_INSTANCES = [
+  'https://co.wuk.sh',
+  'https://cobalt.api.thevern.xyz',
+  'https://cobalt.rintsi.com',
+];
 
-function setupMediaSession(track) {
-  if (!('mediaSession' in navigator)) return;
-  navigator.mediaSession.metadata = new MediaMetadata({
-    title:  track.title,
-    artist: track.artist,
-    album:  'Aspotï',
-    artwork: track.thumb ? [{ src: track.thumb, sizes: '320x180', type: 'image/jpeg' }] : [],
-  });
-  navigator.mediaSession.setActionHandler('play',          () => { YT_PLAYER?.playVideo(); });
-  navigator.mediaSession.setActionHandler('pause',         () => { YT_PLAYER?.pauseVideo(); });
-  navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
-  navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
-  navigator.mediaSession.setActionHandler('seekto', e => {
-    if (YT_PLAYER && state.currentDuration) {
-      YT_PLAYER.seekTo(e.seekTime, true);
+async function resolveAudioUrl(videoId) {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const res = await fetch(`${base}/api/json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          url: ytUrl,
+          vCodec: 'h264',
+          vQuality: '144',   // lowest video quality — we only want audio
+          aFormat: 'mp3',
+          isAudioOnly: true, // ← key flag: audio-only stream
+          disableMetadata: true,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      // Cobalt returns { status: 'stream'|'redirect'|'picker', url: '...' }
+      if ((data.status === 'stream' || data.status === 'redirect') && data.url) {
+        return data.url;
+      }
+      // Some instances return status 'tunnel'
+      if (data.status === 'tunnel' && data.url) return data.url;
+    } catch {
+      // Try next instance
     }
-  });
-}
-
-/* ── YOUTUBE IFrame API ── */
-let YT_PLAYER = null;
-let YT_READY_CB = null;
-
-window.onYouTubeIframeAPIReady = function () {
-  YT_PLAYER = new YT.Player('yt-player', {
-    height: '1', width: '1',
-    playerVars: { autoplay: 0, controls: 0, disablekb: 1, modestbranding: 1 },
-    events: {
-      onReady() {
-        state.playerReady = true;
-        YT_PLAYER.setVolume(state.volumeLevel);
-        if (YT_READY_CB) { YT_READY_CB(); YT_READY_CB = null; }
-      },
-      onStateChange(e) {
-        if (e.data === YT.PlayerState.PLAYING) onPlay();
-        else if (e.data === YT.PlayerState.PAUSED) onPause();
-        else if (e.data === YT.PlayerState.ENDED) onEnded();
-      },
-    },
-  });
-};
-
-function loadYTScript() {
-  if (document.getElementById('yt-sdk')) return;
-  const s = document.createElement('script');
-  s.id = 'yt-sdk';
-  s.src = 'https://www.youtube.com/iframe_api';
-  document.head.appendChild(s);
+  }
+  return null;
 }
 
 /* ── PLAYBACK ── */
-function playTrack(track, queueOverride, idx) {
+async function playTrack(track, queueOverride, idx) {
   if (queueOverride) { state.queue = queueOverride; state.queueIdx = idx ?? 0; }
   state.currentTrack = track;
   state.playing = false;
+  state.loading = true;
 
   updateNowPlaying(track);
   updateMiniPlayer(track);
   updateArtColor(track.thumb);
   resetProgressUI();
   setupMediaSession(track);
+  showLoadingState(true);
 
-  const doPlay = () => {
-    YT_PLAYER.loadVideoById(track.videoId);
+  // Stop current playback immediately
+  AUDIO.pause();
+  AUDIO.src = '';
+
+  try {
+    const url = await resolveAudioUrl(track.videoId);
+    if (!url) {
+      toast('Could not load audio — try another song');
+      showLoadingState(false);
+      state.loading = false;
+      return;
+    }
+
+    // If the user tapped another song while this was resolving, bail
+    if (state.currentTrack?.videoId !== track.videoId) return;
+
+    AUDIO.src = url;
+    AUDIO.volume = state.volumeLevel / 100;
+    await AUDIO.play();
     addToHistory(track);
-  };
-
-  if (!state.playerReady) { YT_READY_CB = doPlay; }
-  else { doPlay(); }
+  } catch (err) {
+    if (err.name === 'AbortError' || err.name === 'NotAllowedError') return;
+    toast('Playback failed — trying next song');
+    showLoadingState(false);
+    state.loading = false;
+    seekNext();
+  }
 }
 
 function togglePlayPause() {
-  if (!YT_PLAYER || !state.currentTrack) return;
-  if (state.playing) YT_PLAYER.pauseVideo();
-  else YT_PLAYER.playVideo();
+  if (!state.currentTrack) return;
+  if (state.playing) {
+    AUDIO.pause();
+  } else {
+    AUDIO.play().catch(() => {});
+  }
 }
 
 function seekPrev() {
-  const cur = YT_PLAYER ? YT_PLAYER.getCurrentTime() : 0;
-  if (cur > 3) { YT_PLAYER.seekTo(0, true); return; }
+  if (AUDIO.currentTime > 3) { AUDIO.currentTime = 0; return; }
   if (state.queueIdx > 0) {
     state.queueIdx--;
     playTrack(state.queue[state.queueIdx]);
@@ -171,28 +172,61 @@ function seekNext() {
   }
 }
 
-function onPlay() {
+/* ── AUDIO ELEMENT EVENT HANDLERS ── */
+AUDIO.addEventListener('play', () => {
   state.playing = true;
+  state.loading = false;
+  showLoadingState(false);
   updatePlayIcons(true);
   artContainer.classList.add('playing');
   artContainer.classList.remove('paused');
   startProgressLoop();
-  startSilentAudio();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-}
+});
 
-function onPause() {
+AUDIO.addEventListener('pause', () => {
   state.playing = false;
   updatePlayIcons(false);
   artContainer.classList.remove('playing');
   artContainer.classList.add('paused');
-  stopSilentAudio();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-}
+});
 
-function onEnded() {
-  if (state.repeat === 'one') { YT_PLAYER.seekTo(0, true); YT_PLAYER.playVideo(); return; }
+AUDIO.addEventListener('ended', () => {
+  state.playing = false;
+  if (state.repeat === 'one') {
+    AUDIO.currentTime = 0;
+    AUDIO.play().catch(() => {});
+    return;
+  }
   seekNext();
+});
+
+AUDIO.addEventListener('error', () => {
+  if (!state.currentTrack) return;
+  state.loading = false;
+  showLoadingState(false);
+  toast('Stream error — skipping');
+  seekNext();
+});
+
+AUDIO.addEventListener('waiting', () => showLoadingState(true));
+AUDIO.addEventListener('canplay', () => { showLoadingState(false); });
+
+/* ── LOADING STATE ── */
+function showLoadingState(loading) {
+  const ppPlay  = el('pp-play');
+  const ppPause = el('pp-pause');
+  const ppSpin  = el('pp-spin');
+  if (!ppPlay) return;
+  if (loading) {
+    ppPlay.style.display  = 'none';
+    ppPause.style.display = 'none';
+    if (ppSpin) ppSpin.style.display = '';
+  } else {
+    if (ppSpin) ppSpin.style.display = 'none';
+    updatePlayIcons(state.playing);
+  }
 }
 
 /* ── PROGRESS LOOP ── */
@@ -200,12 +234,18 @@ let progressRAF = null;
 function startProgressLoop() {
   if (progressRAF) cancelAnimationFrame(progressRAF);
   function tick() {
-    if (!YT_PLAYER || !state.playing) return;
-    const cur = YT_PLAYER.getCurrentTime() || 0;
-    const dur = YT_PLAYER.getDuration() || 0;
+    if (!state.playing) return;
+    const cur = AUDIO.currentTime || 0;
+    const dur = AUDIO.duration   || 0;
     state.currentDuration = dur;
     const pct = dur ? (cur / dur) * 100 : 0;
     updateProgressUI(pct, cur, dur);
+    // Keep Media Session position in sync
+    if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && dur) {
+      try {
+        navigator.mediaSession.setPositionState({ duration: dur, playbackRate: 1, position: cur });
+      } catch {}
+    }
     progressRAF = requestAnimationFrame(tick);
   }
   progressRAF = requestAnimationFrame(tick);
@@ -215,7 +255,6 @@ function updateProgressUI(pct, cur, dur) {
   const slider = el('np-progress');
   if (!slider) return;
   slider.value = pct;
-  // Keep --pct at least 0.01% so WebKit always renders the filled track + thumb
   slider.style.setProperty('--pct', Math.max(pct, 0.01) + '%');
   el('np-current').textContent = fmtTime(cur);
   el('np-duration').textContent = fmtTime(dur);
@@ -223,6 +262,32 @@ function updateProgressUI(pct, cur, dur) {
 
 function resetProgressUI() {
   updateProgressUI(0.01, 0, 0);
+}
+
+/* ── MEDIA SESSION API ── */
+function setupMediaSession(track) {
+  if (!('mediaSession' in navigator)) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title:   track.title,
+    artist:  track.artist,
+    album:   'Aspotï',
+    artwork: track.thumb
+      ? [{ src: track.thumb, sizes: '320x180', type: 'image/jpeg' }]
+      : [],
+  });
+  navigator.mediaSession.setActionHandler('play',          () => AUDIO.play().catch(() => {}));
+  navigator.mediaSession.setActionHandler('pause',         () => AUDIO.pause());
+  navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
+  navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
+  navigator.mediaSession.setActionHandler('seekto', e => {
+    if (state.currentDuration) AUDIO.currentTime = e.seekTime;
+  });
+  navigator.mediaSession.setActionHandler('seekbackward', e => {
+    AUDIO.currentTime = Math.max(0, AUDIO.currentTime - (e.seekOffset || 10));
+  });
+  navigator.mediaSession.setActionHandler('seekforward', e => {
+    AUDIO.currentTime = Math.min(AUDIO.duration, AUDIO.currentTime + (e.seekOffset || 10));
+  });
 }
 
 /* ── HISTORY ── */
@@ -316,17 +381,17 @@ async function searchYouTube(query) {
     const data = await res.json();
     return (data.items || []).map(item => ({
       videoId: item.id.videoId,
-      title: decodeHTML(item.snippet.title),
-      artist: decodeHTML(item.snippet.channelTitle),
-      thumb: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
+      title:   decodeHTML(item.snippet.title),
+      artist:  decodeHTML(item.snippet.channelTitle),
+      thumb:   item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
     }));
-  } catch (e) {
+  } catch {
     toast('Search failed — check your connection');
     return [];
   }
 }
 
-/* ── ART COLOR EXTRACTION (simple dominant color via canvas) ── */
+/* ── ART COLOR EXTRACTION ── */
 function updateArtColor(thumbUrl) {
   if (!thumbUrl) return;
   const img = new Image();
@@ -356,38 +421,34 @@ const el = id => document.getElementById(id);
 const artContainer = document.getElementById('np-art-container');
 
 function updateNowPlaying(track) {
-  el('np-title').textContent = track.title;
+  el('np-title').textContent  = track.title;
   el('np-artist').textContent = track.artist;
-  el('np-art').src = track.thumb;
+  el('np-art').src            = track.thumb;
   el('np-heart').classList.toggle('filled', isLiked(track.videoId));
   artContainer.classList.remove('playing');
   artContainer.classList.add('paused');
 }
 
 function updateMiniPlayer(track) {
-  el('mini-title').textContent = track.title;
-  el('mini-artist').textContent = track.artist;
-  el('mini-art-img').src = track.thumb;
+  el('mini-title').textContent    = track.title;
+  el('mini-artist').textContent   = track.artist;
+  el('mini-art-img').src          = track.thumb;
   el('mini-like-btn').classList.toggle('liked', isLiked(track.videoId));
   el('mini-player').classList.remove('hidden');
 }
 
 function updatePlayIcons(playing) {
-  // Now-playing sheet: toggle between the two SVGs (#pp-play / #pp-pause)
   const ppPlay  = el('pp-play');
   const ppPause = el('pp-pause');
   if (ppPlay && ppPause) {
-    ppPlay.style.display  = playing ? 'none'  : '';
-    ppPause.style.display = playing ? ''      : 'none';
+    ppPlay.style.display  = playing ? 'none' : '';
+    ppPause.style.display = playing ? ''     : 'none';
   }
-  // Mini player
   const miniIcon = el('mini-play-icon');
   if (miniIcon) {
-    if (playing) {
-      miniIcon.innerHTML = '<path d="M6 19h4V5H6zm8-14v14h4V5z"/>';
-    } else {
-      miniIcon.innerHTML = '<path d="M8 5v14l11-7z"/>';
-    }
+    miniIcon.innerHTML = playing
+      ? '<path d="M6 19h4V5H6zm8-14v14h4V5z"/>'
+      : '<path d="M8 5v14l11-7z"/>';
   }
 }
 
@@ -395,30 +456,23 @@ function updatePlayIcons(playing) {
 function switchPage(pageId) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   el(pageId).classList.add('active');
-
   document.querySelectorAll('.nav-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.page === pageId);
   });
-
   const titles = {
-    'page-home': 'Listen Now',
-    'page-search': 'Search',
-    'page-library': 'Library',
+    'page-home':     'Listen Now',
+    'page-search':   'Search',
+    'page-library':  'Library',
     'page-settings': 'Settings',
   };
   el('page-title').textContent = titles[pageId] || '';
-
   if (pageId === 'page-library') renderLibrary();
-  if (pageId === 'page-home') renderHome();
+  if (pageId === 'page-home')    renderHome();
 }
 
 /* ── NOW PLAYING SHEET ── */
-function openNowPlaying() {
-  el('now-playing-sheet').classList.remove('hidden');
-}
-function closeNowPlaying() {
-  el('now-playing-sheet').classList.add('hidden');
-}
+function openNowPlaying()  { el('now-playing-sheet').classList.remove('hidden'); }
+function closeNowPlaying() { el('now-playing-sheet').classList.add('hidden'); }
 
 /* ── PLAYLIST DETAIL ── */
 function openPlaylistDetail(id) {
@@ -426,15 +480,14 @@ function openPlaylistDetail(id) {
   const pl = state.playlists.find(p => p.id === id);
   if (!pl) return;
 
-  el('pl-detail-name').textContent = pl.name;
+  el('pl-detail-name').textContent  = pl.name;
   el('pl-detail-title').textContent = pl.name;
   el('pl-detail-count').textContent = pl.tracks.length + ' song' + (pl.tracks.length !== 1 ? 's' : '');
 
-  // Art grid
   const grid = el('pl-art-grid');
   grid.innerHTML = '';
   const thumbs = pl.tracks.slice(0, 4).map(t => t.thumb).filter(Boolean);
-  if (thumbs.length === 1 || thumbs.length === 0) {
+  if (thumbs.length <= 1) {
     grid.classList.add('single');
     if (thumbs[0]) { const img = new Image(); img.src = thumbs[0]; grid.appendChild(img); }
   } else {
@@ -442,7 +495,6 @@ function openPlaylistDetail(id) {
     thumbs.forEach(src => { const img = new Image(); img.src = src; grid.appendChild(img); });
   }
 
-  // Tracks
   const list = el('pl-track-list');
   list.innerHTML = '';
   if (pl.tracks.length === 0) {
@@ -450,11 +502,11 @@ function openPlaylistDetail(id) {
   } else {
     pl.tracks.forEach((track, i) => {
       list.appendChild(buildTrackItem(track, {
-        queue: pl.tracks, idx: i, context: pl.name, onRemove: () => removeFromPlaylist(id, track.videoId)
+        queue: pl.tracks, idx: i, context: pl.name,
+        onRemove: () => removeFromPlaylist(id, track.videoId),
       }));
     });
   }
-
   el('playlist-detail').classList.remove('hidden');
 }
 
@@ -470,7 +522,6 @@ function buildTrackItem(track, opts = {}) {
   div.dataset.videoId = track.videoId;
 
   const liked = isLiked(track.videoId);
-
   div.innerHTML = `
     <div class="track-thumb">
       <img src="${track.thumb}" alt="" loading="lazy" />
@@ -494,8 +545,8 @@ function buildTrackItem(track, opts = {}) {
 
   div.querySelector('.track-thumb').addEventListener('click', () => {
     const queue = opts.queue || [track];
-    const idx = opts.idx ?? 0;
-    state.queue = queue;
+    const idx   = opts.idx ?? 0;
+    state.queue    = queue;
     state.queueIdx = idx;
     if (opts.context) el('np-queue-name').textContent = opts.context;
     playTrack(track);
@@ -515,7 +566,7 @@ function buildTrackItem(track, opts = {}) {
   return div;
 }
 
-/* ── TRACK CONTEXT MENU (inline sheet) ── */
+/* ── TRACK CONTEXT MENU ── */
 function showTrackMenu(track, onRemove) {
   const existing = document.getElementById('track-menu');
   if (existing) existing.remove();
@@ -551,7 +602,7 @@ function showTrackMenu(track, onRemove) {
   cancel.style.cssText = `
     width:calc(100% - 32px);margin:8px 16px 0;padding:16px;
     background:var(--card2);border-radius:var(--radius);
-    font-size:17px;font-weight:600;color:var(--text);
+    font-size:17px;font-weight:600;color:var(--text);border:none;
   `;
   cancel.textContent = 'Cancel';
   menu.appendChild(cancel);
@@ -574,7 +625,7 @@ function showTrackMenu(track, onRemove) {
 
 /* ── ADD TO PLAYLIST MODAL ── */
 function openAddToPlaylist(track) {
-  const modal = el('modal-add-to-playlist');
+  const modal  = el('modal-add-to-playlist');
   const picker = el('playlist-picker');
   picker.innerHTML = '';
 
@@ -585,10 +636,7 @@ function openAddToPlaylist(track) {
       const div = document.createElement('div');
       div.className = 'playlist-pick-item';
       const thumb = pl.tracks[0]?.thumb || '';
-      div.innerHTML = `
-        <img src="${thumb}" alt="" />
-        <span>${esc(pl.name)}</span>
-      `;
+      div.innerHTML = `<img src="${thumb}" alt="" /><span>${esc(pl.name)}</span>`;
       div.addEventListener('click', () => {
         addToPlaylist(pl.id, track);
         closeModal('modal-add-to-playlist');
@@ -596,7 +644,6 @@ function openAddToPlaylist(track) {
       picker.appendChild(div);
     });
   }
-
   modal.classList.remove('hidden');
 }
 
@@ -623,14 +670,11 @@ function renderHomeRecent() {
     grid.innerHTML = '<div class="empty-state-small">Start searching to build your history</div>';
     return;
   }
-  state.history.slice(0, 6).forEach((track, i) => {
+  state.history.slice(0, 6).forEach(track => {
     const div = document.createElement('div');
     div.className = 'recent-item';
     div.innerHTML = `<img src="${track.thumb}" alt="" /><span>${esc(track.title)}</span>`;
-    div.addEventListener('click', () => {
-      playTrack(track, [track], 0);
-      openNowPlaying();
-    });
+    div.addEventListener('click', () => { playTrack(track, [track], 0); openNowPlaying(); });
     grid.appendChild(div);
   });
 }
@@ -645,11 +689,11 @@ function renderHomePlaylists() {
   state.playlists.forEach(pl => {
     const div = document.createElement('div');
     div.className = 'home-pl-card';
-    const thumbs = pl.tracks.slice(0, 4).map(t => t.thumb).filter(Boolean);
+    const thumbs   = pl.tracks.slice(0, 4).map(t => t.thumb).filter(Boolean);
     const isSingle = thumbs.length <= 1;
     div.innerHTML = `
       <div class="home-pl-art ${isSingle ? 'single' : ''}">
-        ${thumbs.length ? thumbs.map(s => `<img src="${s}" alt="" />`).join('') : ''}
+        ${thumbs.map(s => `<img src="${s}" alt="" />`).join('')}
       </div>
       <div class="home-pl-name">${esc(pl.name)}</div>
       <div class="home-pl-count">${pl.tracks.length} song${pl.tracks.length !== 1 ? 's' : ''}</div>
@@ -670,10 +714,7 @@ function renderHomeLiked() {
     const div = document.createElement('div');
     div.className = 'recent-item';
     div.innerHTML = `<img src="${track.thumb}" alt="" /><span>${esc(track.title)}</span>`;
-    div.addEventListener('click', () => {
-      playTrack(track, state.liked, i);
-      openNowPlaying();
-    });
+    div.addEventListener('click', () => { playTrack(track, state.liked, i); openNowPlaying(); });
     row.appendChild(div);
   });
 }
@@ -685,16 +726,13 @@ function renderLibrary() {
 }
 
 function renderLibraryPlaylists() {
-  const list = el('playlist-list');
+  const list  = el('playlist-list');
   const empty = el('empty-playlists');
   list.innerHTML = '';
-  if (state.playlists.length === 0) {
-    empty.style.display = '';
-    return;
-  }
+  if (state.playlists.length === 0) { empty.style.display = ''; return; }
   empty.style.display = 'none';
   state.playlists.forEach(pl => {
-    const div = document.createElement('div');
+    const div   = document.createElement('div');
     div.className = 'track-item';
     const thumb = pl.tracks[0]?.thumb || '';
     div.innerHTML = `
@@ -710,7 +748,7 @@ function renderLibraryPlaylists() {
 }
 
 function renderLibraryLiked() {
-  const list = el('liked-list');
+  const list  = el('liked-list');
   const empty = el('empty-liked');
   list.innerHTML = '';
   if (state.liked.length === 0) { empty.style.display = ''; return; }
@@ -721,7 +759,7 @@ function renderLibraryLiked() {
 }
 
 function renderLibraryHistory() {
-  const list = el('history-list');
+  const list  = el('history-list');
   const empty = el('empty-history');
   list.innerHTML = '';
   if (state.history.length === 0) { empty.style.display = ''; return; }
@@ -732,13 +770,10 @@ function renderLibraryHistory() {
 }
 
 function renderSearchResults(tracks) {
-  const list = el('search-results');
+  const list  = el('search-results');
   const empty = el('search-empty');
   list.innerHTML = '';
-  if (!tracks || tracks.length === 0) {
-    empty.style.display = '';
-    return;
-  }
+  if (!tracks || tracks.length === 0) { empty.style.display = ''; return; }
   empty.style.display = 'none';
   tracks.forEach((track, i) => {
     list.appendChild(buildTrackItem(track, { queue: tracks, idx: i, context: 'Search' }));
@@ -750,7 +785,11 @@ let searchDebounce = null;
 function handleSearch(query) {
   if (searchDebounce) clearTimeout(searchDebounce);
   el('search-clear').style.display = query ? 'flex' : 'none';
-  if (!query.trim()) { el('search-results').innerHTML = ''; el('search-empty').style.display = ''; return; }
+  if (!query.trim()) {
+    el('search-results').innerHTML = '';
+    el('search-empty').style.display = '';
+    return;
+  }
   searchDebounce = setTimeout(async () => {
     el('search-empty').style.display = 'none';
     el('search-results').innerHTML = '<div class="empty-state"><div class="empty-icon" style="animation:spin 1s linear infinite">⟳</div></div>';
@@ -781,13 +820,15 @@ function toast(msg, duration = 2200) {
 /* ── UTILS ── */
 function fmtTime(s) {
   if (!s || isNaN(s)) return '0:00';
-  const m = Math.floor(s / 60);
+  const m   = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return m + ':' + String(sec).padStart(2, '0');
 }
 
 function esc(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(str)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function decodeHTML(str) {
@@ -820,7 +861,7 @@ function decodeHTML(str) {
     dragging = false;
     const dy = curY - startY;
     sheet.style.transition = '';
-    sheet.style.transform = '';
+    sheet.style.transform  = '';
     if (dy > 100) closeNowPlaying();
     startY = 0; curY = 0;
   });
@@ -829,11 +870,8 @@ function decodeHTML(str) {
 /* ── EVENT LISTENERS ── */
 document.addEventListener('DOMContentLoaded', () => {
 
-  loadYTScript();
   renderHome();
   setGreeting();
-
-  // API key is hardcoded — no user input needed
 
   // Volume init
   el('np-volume').value = state.volumeLevel;
@@ -851,17 +889,17 @@ document.addEventListener('DOMContentLoaded', () => {
       tab.classList.add('active');
       const which = tab.dataset.tab;
       el('lib-playlists').style.display = which === 'playlists' ? '' : 'none';
-      el('lib-liked').style.display = which === 'liked' ? '' : 'none';
-      el('lib-history').style.display = which === 'history' ? '' : 'none';
-      if (which === 'liked') renderLibraryLiked();
+      el('lib-liked').style.display     = which === 'liked'     ? '' : 'none';
+      el('lib-history').style.display   = which === 'history'   ? '' : 'none';
+      if (which === 'liked')   renderLibraryLiked();
       if (which === 'history') renderLibraryHistory();
     });
   });
 
   // Search
-  el('search-input').addEventListener('input', e => handleSearch(e.target.value));
-  el('search-input').addEventListener('focus', () => switchPage('page-search'));
-  el('search-clear').addEventListener('click', () => {
+  el('search-input').addEventListener('input',  e => handleSearch(e.target.value));
+  el('search-input').addEventListener('focus',  () => switchPage('page-search'));
+  el('search-clear').addEventListener('click',  () => {
     el('search-input').value = '';
     el('search-results').innerHTML = '';
     el('search-empty').style.display = '';
@@ -893,11 +931,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Now playing controls
   el('np-close').addEventListener('click', closeNowPlaying);
-  el('np-play').addEventListener('click', togglePlayPause);
-  el('np-prev').addEventListener('click', seekPrev);
-  el('np-next').addEventListener('click', seekNext);
-  el('np-like-btn').addEventListener('click', () => { if (state.currentTrack) toggleLike(state.currentTrack); });
-  el('np-add-to-playlist').addEventListener('click', () => { if (state.currentTrack) openAddToPlaylist(state.currentTrack); });
+  el('np-play').addEventListener('click',  togglePlayPause);
+  el('np-prev').addEventListener('click',  seekPrev);
+  el('np-next').addEventListener('click',  seekNext);
+  el('np-like-btn').addEventListener('click',         () => { if (state.currentTrack) toggleLike(state.currentTrack); });
+  el('np-add-to-playlist').addEventListener('click',  () => { if (state.currentTrack) openAddToPlaylist(state.currentTrack); });
 
   el('np-shuffle').addEventListener('click', () => {
     state.shuffle = !state.shuffle;
@@ -909,36 +947,33 @@ document.addEventListener('DOMContentLoaded', () => {
     const modes = ['none', 'all', 'one'];
     state.repeat = modes[(modes.indexOf(state.repeat) + 1) % 3];
     el('np-repeat').classList.toggle('active', state.repeat !== 'none');
-    const labels = { none: 'Repeat off', all: 'Repeat all', one: 'Repeat one' };
-    toast(labels[state.repeat]);
+    toast({ none: 'Repeat off', all: 'Repeat all', one: 'Repeat one' }[state.repeat]);
   });
 
   el('np-progress').addEventListener('input', e => {
-    if (!YT_PLAYER || !state.currentDuration) return;
+    if (!state.currentDuration) return;
     const pct = parseFloat(e.target.value);
-    YT_PLAYER.seekTo((pct / 100) * state.currentDuration, true);
+    AUDIO.currentTime = (pct / 100) * state.currentDuration;
     e.target.style.setProperty('--pct', pct + '%');
   });
 
   el('np-volume').addEventListener('input', e => {
     state.volumeLevel = parseInt(e.target.value);
-    if (YT_PLAYER) YT_PLAYER.setVolume(state.volumeLevel);
+    AUDIO.volume = state.volumeLevel / 100;
     save.volume();
     e.target.style.setProperty('--vol-pct', state.volumeLevel + '%');
   });
 
-  // NP more (simple toast for now)
   el('np-more').addEventListener('click', () => {
     if (state.currentTrack) showTrackMenu(state.currentTrack);
   });
 
-  // NP airplay placeholder
   el('np-airplay').addEventListener('click', () => toast('AirPlay not supported in browser'));
 
   // Playlists
   el('btn-new-playlist').addEventListener('click', () => el('modal-new-playlist').classList.remove('hidden'));
-  el('modal-pl-cancel').addEventListener('click', () => closeModal('modal-new-playlist'));
-  el('modal-pl-create').addEventListener('click', () => {
+  el('modal-pl-cancel').addEventListener('click',  () => closeModal('modal-new-playlist'));
+  el('modal-pl-create').addEventListener('click',  () => {
     const name = el('playlist-name-input').value.trim();
     if (name) { createPlaylist(name); el('playlist-name-input').value = ''; closeModal('modal-new-playlist'); }
   });
@@ -973,8 +1008,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Settings
-
-
   el('toggle-bg-audio').checked = state.bgAudio;
   el('toggle-bg-audio').addEventListener('change', e => {
     state.bgAudio = e.target.checked;
