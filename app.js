@@ -44,40 +44,109 @@ const save = {
 };
 
 /* ════════════════════════════════════════════════════
-   NATIVE AUDIO ENGINE
-   Uses a real <audio> element so iOS keeps playing in
-   the background / with screen off — iframes can't do this.
-
-   HOW IT WORKS:
-   1. We ask a Cloudflare Worker for the stream URL.
-      The Worker fetches from Piped (server-side, no CORS),
-      then proxies the audio bytes back with open CORS headers.
-   2. The <audio> element loads the proxied stream URL directly.
-
-   SETUP (one time, free):
-   1. Go to https://workers.cloudflare.com → sign up free
-   2. Create a new Worker, paste the code from worker.js
-   3. Deploy it and copy your worker URL (e.g. https://aspoti.YOUR-NAME.workers.dev)
-   4. Paste it into WORKER_URL below.
+   YOUTUBE IFRAME AUDIO ENGINE
+   No server, no worker, no cost — plays directly via
+   the YouTube IFrame API. A silent looping <audio>
+   element keeps iOS audio session alive so playback
+   continues with the screen off.
    ════════════════════════════════════════════════════ */
 
-const AUDIO = new Audio();
-AUDIO.preload = 'auto';
+/* ── SILENT AUDIO KEEP-ALIVE (iOS background trick) ── */
+// A 1-second silent mp3 as a data URI — loops forever to
+// hold the iOS audio session open so the YT iframe keeps playing
+const SILENT_MP3 = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV';
 
-// ▼ PASTE YOUR CLOUDFLARE WORKER URL HERE (no trailing slash)
-const WORKER_URL = 'https://damp-night-1885.themillsteam11.workers.dev';
+const keepAlive = new Audio(SILENT_MP3);
+keepAlive.loop = true;
+keepAlive.volume = 0.001; // effectively silent
 
-async function resolveAudioUrl(videoId) {
-  try {
-    const res = await fetch(`${WORKER_URL}/stream/${videoId}`, {
-      signal: AbortSignal.timeout(12000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.url || null;
-  } catch {
-    return null;
+/* ── YOUTUBE IFRAME PLAYER ── */
+let YTPlayer = null;
+let ytReady = false;
+let ytReadyCallbacks = [];
+
+// Load YouTube IFrame API script once
+(function loadYTApi() {
+  if (window.YT && window.YT.Player) { ytReady = true; return; }
+  const tag = document.createElement('script');
+  tag.src = 'https://www.youtube.com/iframe_api';
+  document.head.appendChild(tag);
+})();
+
+window.onYouTubeIframeAPIReady = function () {
+  ytReady = true;
+
+  // Hidden 1x1 iframe container
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;bottom:0;left:0;z-index:-1';
+  document.body.appendChild(wrap);
+
+  YTPlayer = new YT.Player(wrap, {
+    width: 1,
+    height: 1,
+    playerVars: {
+      autoplay: 0,
+      controls: 0,
+      disablekb: 1,
+      fs: 0,
+      iv_load_policy: 3,
+      modestbranding: 1,
+      playsinline: 1,
+      rel: 0,
+    },
+    events: {
+      onReady: () => {
+        ytReadyCallbacks.forEach(fn => fn());
+        ytReadyCallbacks = [];
+      },
+      onStateChange: onYTStateChange,
+      onError: onYTError,
+    },
+  });
+};
+
+function onYTStateChange(e) {
+  const S = YT.PlayerState;
+  if (e.data === S.PLAYING) {
+    state.playing = true;
+    state.loading = false;
+    showLoadingState(false);
+    updatePlayIcons(true);
+    artContainer.classList.add('playing');
+    artContainer.classList.remove('paused');
+    startProgressLoop();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  } else if (e.data === S.PAUSED) {
+    state.playing = false;
+    updatePlayIcons(false);
+    artContainer.classList.remove('playing');
+    artContainer.classList.add('paused');
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  } else if (e.data === S.ENDED) {
+    state.playing = false;
+    if (state.repeat === 'one') {
+      YTPlayer.seekTo(0);
+      YTPlayer.playVideo();
+    } else {
+      seekNext();
+    }
+  } else if (e.data === S.BUFFERING) {
+    showLoadingState(true);
   }
+}
+
+function onYTError(e) {
+  // YT error codes: 2=bad id, 5=html5 error, 100=not found, 101/150=embed not allowed
+  console.warn('YT error', e.data);
+  state.loading = false;
+  showLoadingState(false);
+  toast('Skipping — not available');
+  seekNext();
+}
+
+function whenYTReady(fn) {
+  if (YTPlayer && ytReady) { fn(); }
+  else { ytReadyCallbacks.push(fn); }
 }
 
 /* ── PLAYBACK ── */
@@ -94,46 +163,27 @@ async function playTrack(track, queueOverride, idx) {
   setupMediaSession(track);
   showLoadingState(true);
 
-  // Stop current playback immediately
-  AUDIO.pause();
-  AUDIO.src = '';
+  // Start keep-alive so iOS holds audio session
+  keepAlive.play().catch(() => {});
 
-  try {
-    const url = await resolveAudioUrl(track.videoId);
-    if (!url) {
-      toast('Could not load audio — try another song');
-      showLoadingState(false);
-      state.loading = false;
-      return;
-    }
-
-    // If the user tapped another song while this was resolving, bail
-    if (state.currentTrack?.videoId !== track.videoId) return;
-
-    AUDIO.src = url;
-    AUDIO.volume = state.volumeLevel / 100;
-    await AUDIO.play();
+  whenYTReady(() => {
+    YTPlayer.loadVideoById(track.videoId);
+    YTPlayer.setVolume(state.volumeLevel);
     addToHistory(track);
-  } catch (err) {
-    if (err.name === 'AbortError' || err.name === 'NotAllowedError') return;
-    toast('Playback failed — trying next song');
-    showLoadingState(false);
-    state.loading = false;
-    seekNext();
-  }
+  });
 }
 
 function togglePlayPause() {
-  if (!state.currentTrack) return;
+  if (!state.currentTrack || !YTPlayer) return;
   if (state.playing) {
-    AUDIO.pause();
+    YTPlayer.pauseVideo();
   } else {
-    AUDIO.play().catch(() => {});
+    YTPlayer.playVideo();
   }
 }
 
 function seekPrev() {
-  if (AUDIO.currentTime > 3) { AUDIO.currentTime = 0; return; }
+  if (YTPlayer && YTPlayer.getCurrentTime() > 3) { YTPlayer.seekTo(0); return; }
   if (state.queueIdx > 0) {
     state.queueIdx--;
     playTrack(state.queue[state.queueIdx]);
@@ -159,47 +209,6 @@ function seekNext() {
   }
 }
 
-/* ── AUDIO ELEMENT EVENT HANDLERS ── */
-AUDIO.addEventListener('play', () => {
-  state.playing = true;
-  state.loading = false;
-  showLoadingState(false);
-  updatePlayIcons(true);
-  artContainer.classList.add('playing');
-  artContainer.classList.remove('paused');
-  startProgressLoop();
-  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-});
-
-AUDIO.addEventListener('pause', () => {
-  state.playing = false;
-  updatePlayIcons(false);
-  artContainer.classList.remove('playing');
-  artContainer.classList.add('paused');
-  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-});
-
-AUDIO.addEventListener('ended', () => {
-  state.playing = false;
-  if (state.repeat === 'one') {
-    AUDIO.currentTime = 0;
-    AUDIO.play().catch(() => {});
-    return;
-  }
-  seekNext();
-});
-
-AUDIO.addEventListener('error', () => {
-  if (!state.currentTrack) return;
-  state.loading = false;
-  showLoadingState(false);
-  toast('Stream error — skipping');
-  seekNext();
-});
-
-AUDIO.addEventListener('waiting', () => showLoadingState(true));
-AUDIO.addEventListener('canplay', () => { showLoadingState(false); });
-
 /* ── LOADING STATE ── */
 function showLoadingState(loading) {
   const ppPlay  = el('pp-play');
@@ -221,17 +230,14 @@ let progressRAF = null;
 function startProgressLoop() {
   if (progressRAF) cancelAnimationFrame(progressRAF);
   function tick() {
-    if (!state.playing) return;
-    const cur = AUDIO.currentTime || 0;
-    const dur = AUDIO.duration   || 0;
+    if (!state.playing || !YTPlayer) return;
+    const cur = YTPlayer.getCurrentTime() || 0;
+    const dur = YTPlayer.getDuration()    || 0;
     state.currentDuration = dur;
     const pct = dur ? (cur / dur) * 100 : 0;
     updateProgressUI(pct, cur, dur);
-    // Keep Media Session position in sync
     if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && dur) {
-      try {
-        navigator.mediaSession.setPositionState({ duration: dur, playbackRate: 1, position: cur });
-      } catch {}
+      try { navigator.mediaSession.setPositionState({ duration: dur, playbackRate: 1, position: cur }); } catch {}
     }
     progressRAF = requestAnimationFrame(tick);
   }
@@ -262,18 +268,18 @@ function setupMediaSession(track) {
       ? [{ src: track.thumb, sizes: '320x180', type: 'image/jpeg' }]
       : [],
   });
-  navigator.mediaSession.setActionHandler('play',          () => AUDIO.play().catch(() => {}));
-  navigator.mediaSession.setActionHandler('pause',         () => AUDIO.pause());
+  navigator.mediaSession.setActionHandler('play',          () => YTPlayer?.playVideo());
+  navigator.mediaSession.setActionHandler('pause',         () => YTPlayer?.pauseVideo());
   navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
   navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
   navigator.mediaSession.setActionHandler('seekto', e => {
-    if (state.currentDuration) AUDIO.currentTime = e.seekTime;
+    if (YTPlayer && state.currentDuration) YTPlayer.seekTo(e.seekTime);
   });
   navigator.mediaSession.setActionHandler('seekbackward', e => {
-    AUDIO.currentTime = Math.max(0, AUDIO.currentTime - (e.seekOffset || 10));
+    if (YTPlayer) YTPlayer.seekTo(Math.max(0, YTPlayer.getCurrentTime() - (e.seekOffset || 10)));
   });
   navigator.mediaSession.setActionHandler('seekforward', e => {
-    AUDIO.currentTime = Math.min(AUDIO.duration, AUDIO.currentTime + (e.seekOffset || 10));
+    if (YTPlayer) YTPlayer.seekTo(Math.min(YTPlayer.getDuration(), YTPlayer.getCurrentTime() + (e.seekOffset || 10)));
   });
 }
 
@@ -940,13 +946,13 @@ document.addEventListener('DOMContentLoaded', () => {
   el('np-progress').addEventListener('input', e => {
     if (!state.currentDuration) return;
     const pct = parseFloat(e.target.value);
-    AUDIO.currentTime = (pct / 100) * state.currentDuration;
+    if (YTPlayer) YTPlayer.seekTo((pct / 100) * state.currentDuration);
     e.target.style.setProperty('--pct', pct + '%');
   });
 
   el('np-volume').addEventListener('input', e => {
     state.volumeLevel = parseInt(e.target.value);
-    AUDIO.volume = state.volumeLevel / 100;
+    if (YTPlayer) YTPlayer.setVolume(state.volumeLevel);
     save.volume();
     e.target.style.setProperty('--vol-pct', state.volumeLevel + '%');
   });
