@@ -317,10 +317,16 @@
         </svg>
       </button>
       <button class="icon-btn play-pause-btn" id="np-play" aria-label="Play/Pause">
-        <svg id="np-play-icon" width="58" height="58" viewBox="0 0 58 58">
-          <circle cx="29" cy="29" r="29" fill="white"/>
-          <path id="pp-path" d="M22 18v22l18-11z" fill="#0D0D0F"/>
-        </svg>
+        <div class="pp-circle">
+          <!-- Play icon (shown when paused) -->
+          <svg id="pp-play" width="26" height="26" viewBox="0 0 24 24" fill="#0D0D0F">
+            <path d="M6 4.75v14.5a.75.75 0 001.16.627l11.5-7.25a.75.75 0 000-1.254L7.16 4.123A.75.75 0 006 4.75z"/>
+          </svg>
+          <!-- Pause icon (shown when playing) -->
+          <svg id="pp-pause" width="26" height="26" viewBox="0 0 24 24" fill="#0D0D0F" style="display:none">
+            <path d="M6 5a1 1 0 011-1h2a1 1 0 011 1v14a1 1 0 01-1 1H7a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h2a1 1 0 011 1v14a1 1 0 01-1 1h-2a1 1 0 01-1-1V5z"/>
+          </svg>
+        </div>
       </button>
       <button class="icon-btn ctrl-btn next-btn" id="np-next" aria-label="Next">
         <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor">
