@@ -47,47 +47,37 @@ const save = {
    NATIVE AUDIO ENGINE
    Uses a real <audio> element so iOS keeps playing in
    the background / with screen off — iframes can't do this.
-   Audio URL is resolved via Piped public instances —
-   open-source YouTube proxies with no key required.
-   Falls back through multiple instances automatically.
+
+   HOW IT WORKS:
+   1. We ask a Cloudflare Worker for the stream URL.
+      The Worker fetches from Piped (server-side, no CORS),
+      then proxies the audio bytes back with open CORS headers.
+   2. The <audio> element loads the proxied stream URL directly.
+
+   SETUP (one time, free):
+   1. Go to https://workers.cloudflare.com → sign up free
+   2. Create a new Worker, paste the code from worker.js
+   3. Deploy it and copy your worker URL (e.g. https://aspoti.YOUR-NAME.workers.dev)
+   4. Paste it into WORKER_URL below.
    ════════════════════════════════════════════════════ */
 
 const AUDIO = new Audio();
 AUDIO.preload = 'auto';
 
-// Public Piped API instances — tried in order until one works.
-// These return direct YouTube CDN audio stream URLs.
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.yt',
-  'https://piped.syncrea.eu',
-  'https://piped.drgns.space',
-];
+// ▼ PASTE YOUR CLOUDFLARE WORKER URL HERE (no trailing slash)
+const WORKER_URL = 'https://damp-night-1885.themillsteam11.workers.dev';
 
 async function resolveAudioUrl(videoId) {
-  for (const base of PIPED_INSTANCES) {
-    try {
-      const res = await fetch(`${base}/streams/${videoId}`, {
-        headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(9000),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-
-      // data.audioStreams is an array of { url, bitrate, mimeType, ... }
-      const streams = (data.audioStreams || [])
-        .filter(s => s.url && s.mimeType && s.mimeType.includes('audio'))
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-      if (streams.length > 0) {
-        return streams[0].url;
-      }
-    } catch {
-      // Instance unreachable or timed out — try next
-    }
+  try {
+    const res = await fetch(`${WORKER_URL}/stream/${videoId}`, {
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.url || null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /* ── PLAYBACK ── */
