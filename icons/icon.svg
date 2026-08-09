@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <rect width="192" height="192" rx="42" fill="#0D0D0F"/>
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FC3C8F"/>
+      <stop offset="100%" stop-color="#FF6BAE"/>
+    </linearGradient>
+  </defs>
+  <!-- Musical note / A letterform hybrid -->
+  <text x="96" y="125" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Helvetica Neue,sans-serif" font-weight="800" font-size="88" fill="url(#g)">A</text>
+  <circle cx="136" cy="82" r="10" fill="url(#g)" opacity="0.8"/>
+  <line x1="136" y1="72" x2="136" y2="42" stroke="url(#g)" stroke-width="5" stroke-linecap="round"/>
+  <line x1="136" y1="42" x2="158" y2="36" stroke="url(#g)" stroke-width="5" stroke-linecap="round"/>
+</svg>
