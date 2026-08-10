@@ -53,6 +53,48 @@ const INVIDIOUS_INSTANCES = [
   'https://invidious.privacydev.net',
 ];
 
+/* ── INSTANCE HEALTH TRACKER ──
+   Keeps a lightweight score per instance. Successful fetches boost the score;
+   failures reduce it. Instances are tried fastest-first by sorting on score,
+   so a dead instance drifts to the back over time automatically.
+   Scores are session-only (no localStorage) to avoid stale data across sessions. */
+const instanceHealth = (() => {
+  const scores = {};
+  INVIDIOUS_INSTANCES.forEach(b => { scores[b] = 50; }); // Start neutral at 50
+  return {
+    success(base) { scores[base] = Math.min(100, (scores[base] || 50) + 20); },
+    failure(base) { scores[base] = Math.max(0,   (scores[base] || 50) - 15); },
+    sorted()      { return [...INVIDIOUS_INSTANCES].sort((a, b) => (scores[b] || 0) - (scores[a] || 0)); },
+  };
+})();
+
+/* ── STREAM URL CACHE ──
+   Caches resolved stream URLs keyed by videoId for ~8 minutes.
+   Invidious stream tokens typically expire after ~6h, but we use a short TTL
+   so we always get a fresh URL after a pause of 8+ minutes (common on iOS
+   when the user locks the screen). This avoids the most common "re-play from
+   scratch" scenario while also preventing stale 403s on long sessions. */
+const streamCache = (() => {
+  const cache = new Map(); // videoId → { url, duration, ts }
+  const TTL = 8 * 60 * 1000; // 8 minutes
+  return {
+    get(videoId) {
+      const entry = cache.get(videoId);
+      if (!entry) return null;
+      if (Date.now() - entry.ts > TTL) { cache.delete(videoId); return null; }
+      return entry;
+    },
+    set(videoId, url, duration) {
+      cache.set(videoId, { url, duration, ts: Date.now() });
+      // Keep cache small — evict oldest if > 30 entries
+      if (cache.size > 30) {
+        const oldest = [...cache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+        if (oldest) cache.delete(oldest[0]);
+      }
+    },
+  };
+})();
+
 const AUDIO = new Audio();
 AUDIO.preload = 'none';
 AUDIO.setAttribute('playsinline', '');
@@ -150,9 +192,15 @@ function pickBestAudioStream(adaptiveFormats) {
   return preferred || audioFormats[0];
 }
 
-async function fetchFromInvidious(base, videoId) {
+async function fetchFromInvidious(base, videoId, signal) {
   const url = base ? `${base}/api/v1/videos/${videoId}` : `/api/v1/videos/${videoId}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  // Use a 4 s per-instance timeout when racing (fail fast so the winner
+  // resolves quickly); the caller also holds an outer AbortController.
+  const timeoutSignal = AbortSignal.timeout(4000);
+  const combinedSignal = signal
+    ? AbortSignal.any ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+    : timeoutSignal;
+  const res = await fetch(url, { signal: combinedSignal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
   if (!data || !('adaptiveFormats' in data) || !Array.isArray(data.adaptiveFormats)) throw new Error(data?.error || 'adaptiveFormats missing');
@@ -160,22 +208,52 @@ async function fetchFromInvidious(base, videoId) {
   return data;
 }
 
+/* resolveAudioUrl — races all Invidious instances in parallel.
+   The first instance to return a valid audio stream wins; the rest are
+   cancelled immediately. This slashes worst-case resolution time from
+   potentially 16 s (sequential, 2 dead instances × 8 s timeout) down to
+   the time it takes the fastest live instance to respond (~1-2 s typical).
+   Instance health scores bias the order so known-good instances are tried
+   (and usually win) while dead ones stay quiet at the back. */
 async function resolveAudioUrl(videoId) {
-  for (const base of INVIDIOUS_INSTANCES) {
-    try {
-      const data = await fetchFromInvidious(base, videoId);
-      const stream = pickBestAudioStream(data.adaptiveFormats);
-      if (stream?.url) {
-        console.log(`[Invidious] ${base} → ${stream.type || stream.mimeType} @ ${stream.bitrate}bps`);
-        // Return both the URL and the duration from the API — don't wait for
-        // loadedmetadata which is unreliable on iOS with remote stream URLs.
-        return { url: stream.url, duration: data.lengthSeconds || 0 };
-      }
-    } catch (e) {
-      console.warn(`[Invidious] ${base} failed:`, e.message);
-    }
+  // Fast path: serve from cache if fresh
+  const cached = streamCache.get(videoId);
+  if (cached) {
+    console.log(`[StreamCache] HIT for ${videoId}`);
+    return { url: cached.url, duration: cached.duration };
   }
-  return null;
+
+  const outer = new AbortController();
+  const instances = instanceHealth.sorted();
+
+  return new Promise(resolve => {
+    let settled = false;
+    let pending = instances.length;
+
+    instances.forEach(base => {
+      fetchFromInvidious(base, videoId, outer.signal)
+        .then(data => {
+          if (settled) return;
+          const stream = pickBestAudioStream(data.adaptiveFormats);
+          if (!stream?.url) throw new Error('no usable stream');
+          settled = true;
+          outer.abort(); // cancel all other in-flight requests
+          instanceHealth.success(base);
+          console.log(`[Invidious] ✓ ${base} → ${stream.type || stream.mimeType} @ ${stream.bitrate}bps`);
+          const result = { url: stream.url, duration: data.lengthSeconds || 0 };
+          streamCache.set(videoId, result.url, result.duration);
+          resolve(result);
+        })
+        .catch(e => {
+          if (!outer.signal.aborted) {
+            instanceHealth.failure(base);
+            console.warn(`[Invidious] ✗ ${base}:`, e.message);
+          }
+          pending--;
+          if (pending === 0 && !settled) resolve(null); // all failed
+        });
+    });
+  });
 }
 
 async function loadStreamForTrack(track) {
@@ -198,6 +276,27 @@ async function loadStreamForTrack(track) {
   AUDIO.play().catch(e => { console.warn('play() blocked:', e); showLoadingState(false); updatePlayIcons(false); });
 }
 
+/* ── NEXT-TRACK PRELOAD ──
+   Silently resolves and caches the stream URL for the next track in the
+   queue while the current one is playing, so skipping forward feels instant.
+   Fires once per track after a 15 s delay (gives the current track time to
+   actually start, avoids racing during the initial load). */
+let _preloadTimer = null;
+function scheduleNextTrackPreload() {
+  if (_preloadTimer) { clearTimeout(_preloadTimer); _preloadTimer = null; }
+  _preloadTimer = setTimeout(() => {
+    _preloadTimer = null;
+    const nextIdx = state.shuffle
+      ? null // can't predict shuffle pick
+      : state.queueIdx + 1;
+    if (nextIdx === null || nextIdx >= state.queue.length) return;
+    const nextTrack = state.queue[nextIdx];
+    if (!nextTrack || streamCache.get(nextTrack.videoId)) return; // already cached
+    console.log(`[Preload] Warming cache for next track: ${nextTrack.title}`);
+    resolveAudioUrl(nextTrack.videoId).catch(() => {}); // fire-and-forget
+  }, 15000); // 15 s after current track starts
+}
+
 /* ── PLAYBACK CONTROLS ── */
 async function playTrack(track, queueOverride, idx) {
   if (queueOverride) { state.queue = queueOverride; state.queueIdx = idx ?? 0; }
@@ -213,6 +312,7 @@ async function playTrack(track, queueOverride, idx) {
   showLoadingState(true);
   addToHistory(track);
   loadStreamForTrack(track);
+  scheduleNextTrackPreload();
 }
 
 function togglePlayPause() {
@@ -577,28 +677,53 @@ async function searchYouTube(query) {
   return searchInvidious(query);
 }
 
+/* searchInvidious — races all instances in parallel, same strategy as
+   resolveAudioUrl. First instance that returns ≥1 result wins. */
 async function searchInvidious(query) {
-  for (const base of INVIDIOUS_INSTANCES) {
-    try {
+  const outer = new AbortController();
+  const instances = instanceHealth.sorted();
+
+  return new Promise(resolve => {
+    let settled = false;
+    let pending = instances.length;
+
+    instances.forEach(base => {
       const url = `${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video&fields=videoId,title,author,videoThumbnails&page=1`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (!Array.isArray(data) || !data.length) continue;
-      return data.slice(0, 20).map(item => ({
-        videoId: item.videoId,
-        title:   item.title || '',
-        artist:  item.author || '',
-        // Always use ytimg.com directly — Invidious proxies thumbnail URLs
-        // through its own domain which is blocked by the app's CSP.
-        thumb:   `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
-      }));
-    } catch (e) {
-      console.warn(`[Invidious Search] ${base} failed:`, e.message);
-    }
-  }
-  toast('Search failed — check your connection');
-  return [];
+      const timeoutSignal = AbortSignal.timeout(5000);
+      const combinedSignal = AbortSignal.any
+        ? AbortSignal.any([outer.signal, timeoutSignal])
+        : timeoutSignal;
+
+      fetch(url, { signal: combinedSignal })
+        .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.json(); })
+        .then(data => {
+          if (settled) return;
+          if (!Array.isArray(data) || !data.length) throw new Error('empty');
+          settled = true;
+          outer.abort();
+          instanceHealth.success(base);
+          console.log(`[Invidious Search] ✓ ${base}`);
+          resolve(data.slice(0, 20).map(item => ({
+            videoId: item.videoId,
+            title:   item.title || '',
+            artist:  item.author || '',
+            // Always use ytimg.com directly — Invidious proxies are blocked by CSP
+            thumb:   `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
+          })));
+        })
+        .catch(e => {
+          if (!outer.signal.aborted) {
+            instanceHealth.failure(base);
+            console.warn(`[Invidious Search] ✗ ${base}:`, e.message);
+          }
+          pending--;
+          if (pending === 0 && !settled) {
+            toast('Search failed — check your connection');
+            resolve([]);
+          }
+        });
+    });
+  });
 }
 
 /* ── FEATURED HOME CONTENT ── */
@@ -707,14 +832,15 @@ async function loadFeaturedPlaylists() {
 async function loadFeaturedPlaylistThumbs() {
   const row = el('featured-playlists-row');
   if (!row) return;
-  for (let i = 0; i < FEATURED_PLAYLISTS.length; i++) {
-    const pl = FEATURED_PLAYLISTS[i];
-    const card = row.children[i];
-    if (!card) continue;
-    const img = card.querySelector('img');
-    if (!img) continue;
 
-    // Try YouTube API first
+  // Fetch all playlist thumbnails in parallel — no reason to wait for each one
+  await Promise.allSettled(FEATURED_PLAYLISTS.map(async (pl, i) => {
+    const card = row.children[i];
+    if (!card) return;
+    const img = card.querySelector('img');
+    if (!img) return;
+
+    // Try YouTube API first (fastest when quota is available)
     let thumb = null;
     try {
       const url = `https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=${pl.id}&key=${state.apiKey}`;
@@ -726,26 +852,38 @@ async function loadFeaturedPlaylistThumbs() {
       }
     } catch {}
 
-    // Fallback: fetch first video ID from the playlist via Invidious,
-    // then build a direct ytimg thumbnail from that videoId.
+    // Fallback: race Invidious instances for the first video ID in the playlist
     if (!thumb) {
-      for (const base of INVIDIOUS_INSTANCES) {
-        try {
+      const outer = new AbortController();
+      thumb = await new Promise(resolve => {
+        let done = false;
+        let pending = INVIDIOUS_INSTANCES.length;
+        instanceHealth.sorted().forEach(base => {
           const url = `${base}/api/v1/playlists/${pl.id}?fields=videos`;
-          const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-          if (!res.ok) continue;
-          const data = await res.json();
-          const firstId = data?.videos?.[0]?.videoId;
-          if (firstId) {
-            thumb = `https://i.ytimg.com/vi/${firstId}/mqdefault.jpg`;
-            break;
-          }
-        } catch {}
-      }
+          const sig = AbortSignal.timeout(5000);
+          fetch(url, { signal: AbortSignal.any ? AbortSignal.any([outer.signal, sig]) : sig })
+            .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+            .then(data => {
+              const firstId = data?.videos?.[0]?.videoId;
+              if (firstId && !done) {
+                done = true;
+                outer.abort();
+                resolve(`https://i.ytimg.com/vi/${firstId}/mqdefault.jpg`);
+              } else {
+                pending--;
+                if (pending === 0 && !done) resolve(null);
+              }
+            })
+            .catch(() => {
+              pending--;
+              if (pending === 0 && !done) resolve(null);
+            });
+        });
+      });
     }
 
     if (thumb) img.src = thumb;
-  }
+  }));
 }
 
 async function loadYouTubePlaylist(pl) {
@@ -1135,7 +1273,7 @@ function handleSearch(query) {
     ensureSpinStyle();
     const results = await searchYouTube(query);
     renderSearchResults(results);
-  }, 500);
+  }, 280);
 }
 
 function ensureSpinStyle() {
