@@ -47,7 +47,13 @@ const save = {
    so iOS respects it for lock screen + background play.
    ════════════════════════════════════════════════════ */
 
-// Multiple instances so we always have a fallback
+// ── InnerTube (YouTube's internal API) — primary source, same as ytify ──
+// The ANDROID client returns plain URLs (no signature cipher needed) and
+// works reliably across regions. Key is public and non-rotating.
+const INNERTUBE_KEY = 'AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w';
+const INNERTUBE_URL = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`;
+
+// Piped/Invidious kept as fallback (they may or may not work depending on instance health)
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
@@ -66,11 +72,9 @@ const INVIDIOUS_INSTANCES = [
 // The single native audio element — this is what iOS respects
 const AUDIO = new Audio();
 AUDIO.preload = 'none';
-// NOTE: Do NOT set crossOrigin = 'anonymous' on the audio element.
-// On iOS Safari/PWA, CORS mode triggers a preflight for streaming URLs that
-// don't return CORS headers, which kills the audio session when backgrounded.
-// Removing crossOrigin lets the browser use a simple request (no preflight),
-// which iOS media session continues to honour in the background.
+// NOTE: Do NOT set crossOrigin = 'anonymous' — on iOS it breaks background audio
+// by triggering a CORS preflight that the stream CDN doesn't satisfy, killing the
+// media session assertion needed for lock-screen / background playback.
 AUDIO.setAttribute('playsinline', '');
 
 // Wire up audio events
@@ -110,73 +114,130 @@ function onAudioEnded() {
 }
 
 function onAudioError() {
-  console.warn('Audio error, trying next fallback or skipping');
-  // If we were loading a track, try the next instance
-  if (state.currentTrack && state._streamAttempt < (PIPED_INSTANCES.length + INVIDIOUS_INSTANCES.length - 1)) {
-    state._streamAttempt = (state._streamAttempt || 0) + 1;
-    loadStreamForTrack(state.currentTrack, state._streamAttempt);
-  } else {
-    showLoadingState(false);
-    toast('Could not load audio — skipping');
-    setTimeout(() => seekNext(), 1500);
+  console.warn('Audio element error — stream URL may have expired or be unsupported');
+  showLoadingState(false);
+  if (state.currentTrack) {
+    toast('Stream error — retrying...');
+    setTimeout(() => loadStreamForTrack(state.currentTrack), 1000);
   }
 }
 
 /* ── STREAM RESOLUTION ── */
-// Tries each instance in order; first one to return a valid audio URL wins
-async function resolveAudioUrl(videoId, attempt = 0) {
-  const allInstances = [
-    ...PIPED_INSTANCES.map(u => ({ type: 'piped', url: u })),
-    ...INVIDIOUS_INSTANCES.map(u => ({ type: 'invidious', url: u })),
-  ];
 
-  if (attempt >= allInstances.length) return null;
-  const inst = allInstances[attempt];
-
+// PRIMARY: YouTube InnerTube /youtubei/v1/player with ANDROID client
+// This is the same method ytify uses. The ANDROID client returns plain,
+// ready-to-use stream URLs with no signature deciphering required.
+async function resolveViaInnertube(videoId) {
   try {
-    if (inst.type === 'piped') {
-      const res = await fetch(`${inst.url}/streams/${videoId}`, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) throw new Error('not ok');
-      const data = await res.json();
-      // Pick best audio stream (highest bitrate, not videoOnly)
-      const streams = (data.audioStreams || []).filter(s => !s.videoOnly);
-      if (!streams.length) throw new Error('no audio streams');
-      // Prefer opus/webm streams — they're what ytify uses and resume best from background.
-      // Fall back to any stream sorted by moderate bitrate (not highest, to avoid fmp4).
-      const opus = streams.filter(s => s.mimeType?.includes('opus') || s.codec?.includes('opus'));
-      const pool = opus.length ? opus : streams;
-      // Sort by bitrate descending but cap preference at ~128kbps for reliability
-      pool.sort((a, b) => b.bitrate - a.bitrate);
-      return pool[0].url;
-    } else {
-      // Invidious
-      const res = await fetch(`${inst.url}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) throw new Error('not ok');
-      const data = await res.json();
-      const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/'));
-      if (!formats.length) throw new Error('no audio formats');
-      // Prefer webm/opus — most reliable for iOS background via Invidious proxy
-      const opusFormats = formats.filter(f => f.type?.includes('opus') || f.type?.includes('webm'));
-      const pool = opusFormats.length ? opusFormats : formats;
-      pool.sort((a, b) => parseInt(b.bitrate) - parseInt(a.bitrate));
-      return pool[0].url;
+    const res = await fetch(INNERTUBE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: 'ANDROID',
+            clientVersion: '19.09.37',
+            androidSdkVersion: 30,
+            userAgent: 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    if (data.playabilityStatus?.status !== 'OK') {
+      throw new Error(`Not playable: ${data.playabilityStatus?.reason || data.playabilityStatus?.status}`);
     }
+
+    const adaptiveFormats = data.streamingData?.adaptiveFormats || [];
+    // Audio-only streams (no width/height)
+    const audioFormats = adaptiveFormats.filter(f =>
+      f.mimeType?.startsWith('audio/') && !f.width
+    );
+    if (!audioFormats.length) throw new Error('no audio streams in InnerTube response');
+
+    // Prefer M4A (audio/mp4) for maximum iOS compatibility, then any audio
+    const m4a = audioFormats.filter(f => f.mimeType?.includes('audio/mp4'));
+    const pool = m4a.length ? m4a : audioFormats;
+    // Sort by bitrate descending, pick highest quality
+    pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const chosen = pool[0];
+    console.log(`[InnerTube] Got stream: ${chosen.mimeType} @ ${chosen.bitrate}bps`);
+    return chosen.url;
   } catch (e) {
-    console.warn(`Instance ${inst.url} failed:`, e.message);
-    return resolveAudioUrl(videoId, attempt + 1);
+    console.warn('[InnerTube] Failed:', e.message);
+    return null;
   }
 }
 
-async function loadStreamForTrack(track, attempt = 0) {
-  state._streamAttempt = attempt;
+// FALLBACK A: Piped instances
+async function resolveViaPiped(videoId, attempt = 0) {
+  if (attempt >= PIPED_INSTANCES.length) return null;
+  const base = PIPED_INSTANCES[attempt];
+  try {
+    const res = await fetch(`${base}/streams/${videoId}`, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const streams = (data.audioStreams || []).filter(s => !s.videoOnly);
+    if (!streams.length) throw new Error('no audio streams');
+    // Prefer m4a/mp4 for iOS, then opus
+    const m4a = streams.filter(s => s.mimeType?.includes('audio/mp4') || s.codec?.includes('mp4a'));
+    const pool = m4a.length ? m4a : streams;
+    pool.sort((a, b) => b.bitrate - a.bitrate);
+    return pool[0].url;
+  } catch (e) {
+    console.warn(`[Piped] ${base} failed:`, e.message);
+    return resolveViaPiped(videoId, attempt + 1);
+  }
+}
+
+// FALLBACK B: Invidious instances
+async function resolveViaInvidious(videoId, attempt = 0) {
+  if (attempt >= INVIDIOUS_INSTANCES.length) return null;
+  const base = INVIDIOUS_INSTANCES[attempt];
+  try {
+    const res = await fetch(`${base}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/'));
+    if (!formats.length) throw new Error('no audio formats');
+    const m4a = formats.filter(f => f.type?.includes('audio/mp4'));
+    const pool = m4a.length ? m4a : formats;
+    pool.sort((a, b) => parseInt(b.bitrate) - parseInt(a.bitrate));
+    return pool[0].url;
+  } catch (e) {
+    console.warn(`[Invidious] ${base} failed:`, e.message);
+    return resolveViaInvidious(videoId, attempt + 1);
+  }
+}
+
+// Master resolver: InnerTube → Piped → Invidious
+async function resolveAudioUrl(videoId) {
+  let url = await resolveViaInnertube(videoId);
+  if (url) return url;
+
+  console.warn('[resolveAudioUrl] InnerTube failed, trying Piped...');
+  url = await resolveViaPiped(videoId);
+  if (url) return url;
+
+  console.warn('[resolveAudioUrl] Piped failed, trying Invidious...');
+  url = await resolveViaInvidious(videoId);
+  return url; // null if all fail
+}
+
+async function loadStreamForTrack(track) {
   showLoadingState(true);
 
-  const audioUrl = await resolveAudioUrl(track.videoId, attempt);
+  const audioUrl = await resolveAudioUrl(track.videoId);
 
   if (!audioUrl) {
     showLoadingState(false);
-    toast('No audio source found — skipping');
-    setTimeout(() => seekNext(), 1500);
+    toast('No audio source found — check your connection');
     return;
   }
 
@@ -199,7 +260,6 @@ async function playTrack(track, queueOverride, idx) {
   state.currentTrack = track;
   state.playing = false;
   state.loading = true;
-  state._streamAttempt = 0;
 
   // Immediately update UI
   updateNowPlaying(track);
@@ -210,8 +270,8 @@ async function playTrack(track, queueOverride, idx) {
   showLoadingState(true);
   addToHistory(track);
 
-  // Kick off stream resolution
-  loadStreamForTrack(track, 0);
+  // Kick off stream resolution (InnerTube → Piped → Invidious)
+  loadStreamForTrack(track);
 }
 
 function togglePlayPause() {
@@ -221,7 +281,7 @@ function togglePlayPause() {
   } else {
     if (!AUDIO.src || AUDIO.src === window.location.href) {
       // No src yet — reload stream
-      loadStreamForTrack(state.currentTrack, 0);
+      loadStreamForTrack(state.currentTrack);
     } else {
       AUDIO.play().catch(() => {});
     }
@@ -435,8 +495,7 @@ async function searchYouTube(query) {
 function updateArtColor(thumbUrl) {
   if (!thumbUrl) return;
   const img = new Image();
-  // Do NOT set crossOrigin here — on iOS it can interrupt the media session
-  // if the CORS preflight fails, which breaks background audio.
+  // Don't set crossOrigin — it can interrupt the iOS media session assertion
   img.onload = function () {
     try {
       const c = document.createElement('canvas');
@@ -778,33 +837,21 @@ function decodeHTML(str) {
 }
 
 /* ── iOS BACKGROUND AUDIO SESSION KEEP-ALIVE ── */
-// iOS 13+ PWAs suspend the audio session after ~30s of backgrounding/pause.
-// Strategy: on visibilitychange (screen unlock / app resume), if we were
-// playing, re-issue play() to reclaim the media session assertion.
-// This mirrors what ytify does to survive lock-screen backgrounding.
+// iOS PWAs suspend the audio session after ~30s of backgrounding.
+// On visibilitychange (screen unlock / app resume), if we were playing
+// but audio got suspended, re-issue play() to reclaim the media session.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.currentTrack) {
     if (state.playing && AUDIO.paused) {
-      // Audio was playing but got suspended — resume it
       AUDIO.play().catch(() => {
-        // If play() fails (session fully dead), reload the stream from scratch
-        loadStreamForTrack(state.currentTrack, 0);
+        // Session fully dead — reload the stream
+        loadStreamForTrack(state.currentTrack);
       });
-    } else if (!state.playing && AUDIO.paused && AUDIO.src && AUDIO.src !== window.location.href) {
-      // Nothing to do — user had it paused intentionally
     }
-    // Refresh Media Session metadata so lock screen controls re-appear
-    if (state.currentTrack && 'mediaSession' in navigator) {
-      setupMediaSession(state.currentTrack);
-    }
+    // Refresh Media Session so lock-screen controls reappear
+    if ('mediaSession' in navigator) setupMediaSession(state.currentTrack);
   }
 });
-
-// Intercept page unload — on iOS PWA, navigating away kills audio.
-// Keep the SW alive so the audio session isn't terminated.
-window.addEventListener('pagehide', () => {
-  // Nothing to do; the service worker handles keeping the shell alive.
-}, { passive: true });
 
 /* ── SWIPE DOWN TO CLOSE NOW PLAYING ── */
 (function setupSwipe() {
