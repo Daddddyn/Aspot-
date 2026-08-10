@@ -63,20 +63,20 @@ AUDIO.addEventListener('ended',   () => onAudioEnded());
 AUDIO.addEventListener('error',   () => onAudioError());
 AUDIO.addEventListener('waiting', () => showLoadingState(true));
 AUDIO.addEventListener('canplay', () => showLoadingState(false));
+// NOTE: We intentionally do NOT update state.currentDuration from loadedmetadata
+// or durationchange. Invidious adaptive audio streams frequently report double
+// the real duration (e.g. 3:20 → 6:40) because the stream container includes
+// both audio and video duration metadata. We rely solely on the API's
+// lengthSeconds value set in loadStreamForTrack, which is always accurate.
 AUDIO.addEventListener('loadedmetadata', () => {
-  // Real duration from the audio element
-  state.currentDuration = AUDIO.duration || 0;
-  // Update the duration display immediately when metadata loads
-  if (state.currentDuration > 0) {
-    el('np-duration').textContent = fmtTime(state.currentDuration);
-  }
-});
-AUDIO.addEventListener('durationchange', () => {
-  if (AUDIO.duration && isFinite(AUDIO.duration)) {
+  // Only use audio element duration as a fallback if the API gave us nothing
+  if (state.currentDuration <= 0 && AUDIO.duration && isFinite(AUDIO.duration)) {
     state.currentDuration = AUDIO.duration;
     el('np-duration').textContent = fmtTime(state.currentDuration);
   }
 });
+// durationchange is suppressed entirely — it fires with doubled values on iOS
+// for Invidious adaptive streams and would overwrite our correct API duration.
 
 function onAudioPlay() {
   state.playing = true;
@@ -236,8 +236,9 @@ function startProgressLoop() {
   function tick() {
     if (!state.playing) return;
     const cur = AUDIO.currentTime || 0;
-    const dur = AUDIO.duration && isFinite(AUDIO.duration) ? AUDIO.duration : 0;
-    if (dur > 0) state.currentDuration = dur;
+    // Always use the API-supplied duration (state.currentDuration).
+    // AUDIO.duration can be doubled for Invidious adaptive streams on iOS.
+    const dur = state.currentDuration > 0 ? state.currentDuration : 0;
     const pct = dur ? (cur / dur) * 100 : 0;
     updateProgressUI(pct, cur, state.currentDuration);
     if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && dur > 0) {
@@ -1192,3 +1193,40 @@ document.addEventListener('DOMContentLoaded', () => {
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
 }
+
+/* ── NAVIGATION GUARD ──
+   Intercepts any accidental <a href> clicks or programmatic navigations that
+   would take the user outside the PWA shell. Without this, external URLs open
+   in Safari (showing the URL bar + the "dangerous site" interstitial if the
+   destination is on Google's Safe Browsing list). All external content is
+   loaded via fetch() instead — this guard is a safety net.
+── */
+document.addEventListener('click', e => {
+  const a = e.target.closest('a[href]');
+  if (!a) return;
+  const href = a.getAttribute('href');
+  // Allow same-origin anchor links (e.g. #section)
+  if (!href || href.startsWith('#')) return;
+  try {
+    const url = new URL(href, window.location.href);
+    if (url.origin !== window.location.origin) {
+      e.preventDefault();
+      console.warn('[Nav Guard] Blocked external navigation to:', url.href);
+    }
+  } catch {}
+}, true);
+
+// Also block window.open calls that might fire from third-party scripts
+const _windowOpen = window.open.bind(window);
+window.open = function(url, ...args) {
+  if (url && typeof url === 'string') {
+    try {
+      const parsed = new URL(url, window.location.href);
+      if (parsed.origin !== window.location.origin) {
+        console.warn('[Nav Guard] Blocked window.open to:', url);
+        return null;
+      }
+    } catch {}
+  }
+  return _windowOpen(url, ...args);
+};
