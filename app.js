@@ -90,6 +90,11 @@ function onAudioPlay() {
 }
 
 function onAudioPause() {
+  // If the page is hidden, this pause was triggered by iOS interrupting the
+  // audio session (screen lock, phone call, app switch) — NOT by the user.
+  // Keep state.playing = true so the visibility resume logic knows to retry.
+  if (document.visibilityState === 'hidden') return;
+
   state.playing = false;
   updatePlayIcons(false);
   artContainer.classList.remove('playing');
@@ -1001,13 +1006,61 @@ function decodeHTML(str) {
 }
 
 /* ── iOS BACKGROUND AUDIO KEEP-ALIVE ── */
+//
+// iOS interruption lifecycle:
+//   1. Screen lock / app switch  → iOS pauses the audio element and fires
+//      an "interruption" on the underlying AVAudioSession.
+//   2. Returning to the app      → iOS resumes the AVAudioSession, but it
+//      does NOT automatically call play() — we have to do that ourselves.
+//      However, we must wait until AFTER iOS has finished its own resume
+//      sequence; calling play() too early causes the "glitch" (a brief
+//      stutter as iOS drops our play() call and then re-issues its own).
+//
+// Strategy:
+//   - On visibility:hidden  → note that we were playing, but do NOTHING
+//     to the audio element (let iOS manage the session).
+//   - On visibility:visible → use a short debounce (300 ms) so iOS finishes
+//     its internal resume first, then check if we still need to resume.
+//   - Re-establish mediaSession metadata every time we return (iOS sometimes
+//     clears the lock-screen widget on app switch).
+
+let _wasPlayingBeforeHide = false;
+let _resumeTimer = null;
+
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.currentTrack) {
-    if (state.playing && AUDIO.paused) {
-      AUDIO.play().catch(() => { loadStreamForTrack(state.currentTrack); });
-    }
-    if ('mediaSession' in navigator) setupMediaSession(state.currentTrack);
+  if (document.visibilityState === 'hidden') {
+    // Snapshot playing state; do NOT touch AUDIO here.
+    _wasPlayingBeforeHide = state.playing && !AUDIO.paused;
+    if (_resumeTimer) { clearTimeout(_resumeTimer); _resumeTimer = null; }
+    return;
   }
+
+  // visible — we're back in the foreground
+  if (_resumeTimer) clearTimeout(_resumeTimer);
+
+  _resumeTimer = setTimeout(() => {
+    _resumeTimer = null;
+
+    // Re-register mediaSession so the lock-screen widget re-appears
+    if ('mediaSession' in navigator && state.currentTrack) {
+      setupMediaSession(state.currentTrack);
+      if (state.playing) {
+        navigator.mediaSession.playbackState = 'playing';
+      }
+    }
+
+    // Only attempt resume if we were playing when we left AND the audio
+    // element actually got paused by iOS (not by the user).
+    if (_wasPlayingBeforeHide && state.playing && AUDIO.paused) {
+      AUDIO.play().catch(() => {
+        // Stream URL may have expired (common after >30 min background);
+        // reload from Invidious.
+        if (state.currentTrack) loadStreamForTrack(state.currentTrack);
+      });
+    }
+
+    _wasPlayingBeforeHide = false;
+  }, 300); // 300 ms grace period for iOS audio session to settle
 });
 
 /* ── SWIPE DOWN TO CLOSE NOW PLAYING ── */
