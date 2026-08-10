@@ -813,27 +813,38 @@ button:active { -webkit-tap-highlight-color: transparent; }
 .np-artist { font-size: 17px; color: var(--text2); margin-top: 3px; font-weight: 500; }
 .np-like .liked-heart path { fill: var(--accent); stroke: var(--accent); }
 
-/* ── CUSTOM PROGRESS SLIDER (replaces broken <input type=range>) ── */
+/* ── CUSTOM PROGRESS SLIDER ── */
 .np-progress-wrap { margin-bottom: 18px; flex-shrink: 0; }
 
 .progress-track {
   position: relative;
   width: 100%;
+  height: 36px; /* tall touch target */
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+  margin-bottom: 2px;
+}
+
+/* The visual rail lives as a pseudo-element so height is decoupled from touch target */
+.progress-track::before {
+  content: '';
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  transform: translateY(-50%);
   height: 4px;
   background: rgba(255,255,255,.2);
   border-radius: 2px;
-  margin-bottom: 6px;
-  cursor: pointer;
-  /* Expand touch target without visual change */
-  padding: 12px 0;
-  margin-top: -12px;
-  box-sizing: content-box;
-  touch-action: none;
+  pointer-events: none;
 }
+
 .progress-fill {
   position: absolute;
-  top: 12px;
   left: 0;
+  top: 50%;
+  transform: translateY(-50%);
   height: 4px;
   background: #fff;
   border-radius: 2px;
@@ -841,21 +852,22 @@ button:active { -webkit-tap-highlight-color: transparent; }
   pointer-events: none;
   transition: width 0.2s linear;
 }
+
 .progress-thumb {
   position: absolute;
-  top: 5px;
+  top: 50%;
   width: 14px; height: 14px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 1px 4px rgba(0,0,0,.4);
-  transform: translateX(-50%);
+  box-shadow: 0 1px 6px rgba(0,0,0,.5);
+  transform: translate(-50%, -50%);
   left: 0%;
   pointer-events: none;
-  transition: transform 0.12s var(--spring), width 0.12s, height 0.12s;
+  transition: width 0.12s var(--spring), height 0.12s var(--spring);
 }
+
 .progress-track.dragging .progress-thumb {
-  width: 18px; height: 18px;
-  top: 3px;
+  width: 20px; height: 20px;
 }
 .progress-track.dragging .progress-fill {
   transition: none;
@@ -874,33 +886,42 @@ button:active { -webkit-tap-highlight-color: transparent; }
 .volume-track {
   flex: 1;
   position: relative;
+  height: 36px; /* tall touch target */
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+.volume-track::before {
+  content: '';
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  transform: translateY(-50%);
   height: 4px;
   background: rgba(255,255,255,.2);
   border-radius: 2px;
-  cursor: pointer;
-  padding: 12px 0;
-  margin: -12px 0;
-  box-sizing: content-box;
-  touch-action: none;
+  pointer-events: none;
 }
 .volume-fill {
   position: absolute;
-  top: 12px;
   left: 0;
+  top: 50%;
+  transform: translateY(-50%);
   height: 4px;
-  background: rgba(255,255,255,.7);
+  background: rgba(255,255,255,.75);
   border-radius: 2px;
   width: 80%;
   pointer-events: none;
 }
 .volume-thumb {
   position: absolute;
-  top: 5px;
+  top: 50%;
   width: 14px; height: 14px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 1px 4px rgba(0,0,0,.4);
-  transform: translateX(-50%);
+  box-shadow: 0 1px 6px rgba(0,0,0,.5);
+  transform: translate(-50%, -50%);
   left: 80%;
   pointer-events: none;
 }
