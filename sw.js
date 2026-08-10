@@ -1,5 +1,5 @@
-/* Aspotï Service Worker v2 */
-const CACHE = 'aspoti-v2';
+/* Aspotï Service Worker v3 — background-audio-safe */
+const CACHE = 'aspoti-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -31,32 +31,40 @@ self.addEventListener('fetch', e => {
 
   const url = e.request.url;
 
-  // Always network-first for audio streams and APIs — they must be fresh
+  // ── NEVER intercept audio streams or API calls ──
+  // These must go directly to network; any SW interception can prevent
+  // iOS from establishing/keeping its background audio session assertion.
   if (
     url.includes('pipedapi') ||
+    url.includes('pipedapi.') ||
     url.includes('invidious') ||
     url.includes('yewtu.be') ||
     url.includes('googleapis.com') ||
     url.includes('videoplayback') ||
     url.includes('/api/v1/') ||
-    url.includes('/streams/')
+    url.includes('/streams/') ||
+    url.includes('googlevideo.com') ||
+    url.includes('ytimg.com')        // thumbnail images — let browser handle
   ) {
-    e.respondWith(
-      fetch(e.request).catch(() => new Response('', { status: 503 }))
-    );
+    // Passthrough: do NOT call e.respondWith() — browser handles natively.
+    // This is critical: calling e.respondWith(fetch(e.request)) still goes
+    // through the SW thread and can block/delay the media session on iOS.
     return;
   }
 
-  // Cache-first for app shell assets
+  // ── Cache-first for app shell assets only ──
   e.respondWith(
     caches.match(e.request).then(cached => {
       if (cached) return cached;
       return fetch(e.request).then(res => {
-        if (res.ok) {
+        if (res && res.ok && res.status === 200) {
           const clone = res.clone();
           caches.open(CACHE).then(c => c.put(e.request, clone));
         }
         return res;
+      }).catch(() => {
+        // Return cached version if network fails for shell assets
+        return caches.match('./index.html');
       });
     })
   );
