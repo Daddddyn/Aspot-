@@ -103,9 +103,18 @@ function onAudioPause() {
 }
 
 function onAudioEnded() {
+  if (state.repeat === 'one') {
+    // Restart immediately — do NOT set state.playing = false first or the
+    // progress loop and play-icon will flicker off before the replay begins.
+    AUDIO.currentTime = 0;
+    AUDIO.play().catch(() => {
+      // If play() is blocked (rare on desktop), reload the stream cleanly
+      if (state.currentTrack) loadStreamForTrack(state.currentTrack);
+    });
+    return;
+  }
   state.playing = false;
-  if (state.repeat === 'one') { AUDIO.currentTime = 0; AUDIO.play().catch(() => {}); }
-  else seekNext();
+  seekNext();
 }
 
 function onAudioError() {
@@ -221,8 +230,37 @@ function seekNext() {
     let next; do { next = Math.floor(Math.random() * state.queue.length); } while (next === state.queueIdx);
     state.queueIdx = next; playTrack(state.queue[next]); return;
   }
-  if (state.queueIdx < state.queue.length - 1) { state.queueIdx++; playTrack(state.queue[state.queueIdx]); }
-  else if (state.repeat === 'all' && state.queue.length) { state.queueIdx = 0; playTrack(state.queue[0]); }
+  if (state.queueIdx < state.queue.length - 1) {
+    state.queueIdx++;
+    playTrack(state.queue[state.queueIdx]);
+  } else if (state.repeat === 'all' && state.queue.length) {
+    state.queueIdx = 0;
+    playTrack(state.queue[0]);
+  } else {
+    // Queue exhausted — load genre radio so playback continues naturally.
+    // Uses the current track's artist as a seed for a related-genre search,
+    // so it won't just queue up the same song name again.
+    loadGenreRadio();
+  }
+}
+
+async function loadGenreRadio() {
+  if (!state.currentTrack) return;
+  showLoadingState(true);
+  // Build a genre/artist seed query — avoids repeating the exact track title
+  const artist = state.currentTrack.artist.replace(/\s*-\s*Topic$/, '').trim();
+  const genre  = state.currentGenre || 'Pop';
+  const query  = `${artist} ${genre} mix`;
+  const results = await searchYouTube(query);
+  showLoadingState(false);
+  if (!results || !results.length) return;
+  // Filter out the currently playing song
+  const filtered = results.filter(r => r.videoId !== state.currentTrack?.videoId);
+  if (!filtered.length) return;
+  state.queue    = filtered;
+  state.queueIdx = 0;
+  el('np-queue-name').textContent = `${artist} Radio`;
+  playTrack(filtered[0]);
 }
 
 /* ── LOADING STATE ── */
@@ -476,22 +514,54 @@ function removeFromPlaylist(playlistId, videoId) {
 
 /* ── YOUTUBE SEARCH ── */
 async function searchYouTube(query) {
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=20&q=${encodeURIComponent(query)}&key=${state.apiKey}`;
+  // Try YouTube Data API first
+  const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=20&q=${encodeURIComponent(query)}&key=${state.apiKey}`;
   try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      if (err.error?.code === 403) toast('API quota hit — try again later');
-      return [];
+    const res = await fetch(ytUrl, { signal: AbortSignal.timeout(6000) });
+    if (res.ok) {
+      const data = await res.json();
+      const items = data.items || [];
+      if (items.length) {
+        return items.map(item => ({
+          videoId: item.id.videoId,
+          title:   decodeHTML(item.snippet.title),
+          artist:  decodeHTML(item.snippet.channelTitle),
+          thumb:   item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
+        }));
+      }
     }
-    const data = await res.json();
-    return (data.items || []).map(item => ({
-      videoId: item.id.videoId,
-      title:   decodeHTML(item.snippet.title),
-      artist:  decodeHTML(item.snippet.channelTitle),
-      thumb:   item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
-    }));
-  } catch { toast('Search failed — check your connection'); return []; }
+    // If quota hit (403) or empty results, fall through to Invidious
+    const errData = res.ok ? null : await res.json().catch(() => ({}));
+    if (errData?.error?.code === 403) {
+      console.warn('[Search] YouTube API quota hit — using Invidious fallback');
+    }
+  } catch (e) {
+    console.warn('[Search] YouTube API failed:', e.message);
+  }
+  // Invidious search fallback
+  return searchInvidious(query);
+}
+
+async function searchInvidious(query) {
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const url = `${base}/api/v1/search?q=${encodeURIComponent(query)}&type=video&fields=videoId,title,author,videoThumbnails&page=1`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!Array.isArray(data) || !data.length) continue;
+      return data.slice(0, 20).map(item => ({
+        videoId: item.videoId,
+        title:   item.title || '',
+        artist:  item.author || '',
+        thumb:   (item.videoThumbnails?.find(t => t.quality === 'medium') || item.videoThumbnails?.[0])?.url || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
+      }));
+    } catch (e) {
+      console.warn(`[Invidious Search] ${base} failed:`, e.message);
+    }
+  }
+  toast('Search failed — check your connection');
+  return [];
 }
 
 /* ── FEATURED HOME CONTENT ── */
@@ -708,6 +778,27 @@ function updatePlayIcons(playing) {
     miniIcon.innerHTML = playing
       ? '<path d="M6 19h4V5H6zm8-14v14h4V5z"/>'
       : '<path d="M8 5v14l11-7z"/>';
+  }
+}
+
+/* ── REPEAT ICON ── */
+function updateRepeatIcon() {
+  const btn = el('np-repeat');
+  if (!btn) return;
+  btn.classList.toggle('active', state.repeat !== 'none');
+  // Show a small "1" overlay badge when repeat-one is active
+  let badge = btn.querySelector('.repeat-one-badge');
+  if (state.repeat === 'one') {
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'repeat-one-badge';
+      badge.textContent = '1';
+      badge.style.cssText = 'position:absolute;top:0;right:0;font-size:9px;font-weight:700;line-height:1;color:var(--accent,#1DB954);pointer-events:none;';
+      btn.style.position = 'relative';
+      btn.appendChild(badge);
+    }
+  } else {
+    if (badge) badge.remove();
   }
 }
 
@@ -1193,7 +1284,7 @@ document.addEventListener('DOMContentLoaded', () => {
   el('np-repeat').addEventListener('click', () => {
     const modes = ['none','all','one'];
     state.repeat = modes[(modes.indexOf(state.repeat) + 1) % 3];
-    el('np-repeat').classList.toggle('active', state.repeat !== 'none');
+    updateRepeatIcon();
     toast({ none:'Repeat off', all:'Repeat all', one:'Repeat one' }[state.repeat]);
   });
 
