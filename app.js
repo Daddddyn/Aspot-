@@ -43,12 +43,12 @@ const save = {
    NATIVE AUDIO ENGINE
    ════════════════════════════════════════════════════ */
 const INVIDIOUS_INSTANCES = [
-  'https://yt.omada.cafe',
-  'https://lekker.gay',
-  'https://yewtu.be',
-  'https://invidious.nerdvpn.de',
   'https://inv.nadeko.net',
+  'https://yewtu.be',
   'https://invidious.privacyredirect.com',
+  'https://invidious.jing.rocks',
+  'https://invidious.nerdvpn.de',
+  'https://yt.omada.cafe',
   'https://iv.datura.network',
   'https://invidious.privacydev.net',
 ];
