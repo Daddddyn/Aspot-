@@ -90,9 +90,15 @@ function onAudioPlay() {
 }
 
 function onAudioPause() {
+  // Always stop the progress RAF when audio pauses — even in background —
+  // so we're not burning CPU on animation frames while nothing is playing.
+  if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
+
   // If the page is hidden, this pause was triggered by iOS interrupting the
   // audio session (screen lock, phone call, app switch) — NOT by the user.
-  // Keep state.playing = true so the visibility resume logic knows to retry.
+  // Keep state.playing = true so the visibility-resume logic knows to retry.
+  // (Intentional lock-screen pauses are handled by the media session handler
+  //  which sets state.playing = false directly before this fires.)
   if (document.visibilityState === 'hidden') return;
 
   state.playing = false;
@@ -443,8 +449,24 @@ function setupMediaSession(track) {
     title: track.title, artist: track.artist, album: 'Aspotï',
     artwork: track.thumb ? [{ src: track.thumb, sizes: '320x180', type: 'image/jpeg' }, { src: track.thumb, sizes: '640x360', type: 'image/jpeg' }] : [],
   });
-  navigator.mediaSession.setActionHandler('play',          () => AUDIO.play().catch(() => {}));
-  navigator.mediaSession.setActionHandler('pause',         () => AUDIO.pause());
+  navigator.mediaSession.setActionHandler('play', () => {
+    // Called from lock screen / Control Center play button.
+    // AUDIO.play() alone fails silently if the stream URL expired or iOS
+    // dropped the buffer. Try play() first; if it rejects, reload the stream.
+    if (AUDIO.src && AUDIO.src !== window.location.href) {
+      AUDIO.play().catch(() => {
+        if (state.currentTrack) loadStreamForTrack(state.currentTrack);
+      });
+    } else if (state.currentTrack) {
+      loadStreamForTrack(state.currentTrack);
+    }
+  });
+  navigator.mediaSession.setActionHandler('pause', () => {
+    AUDIO.pause();
+    // Explicitly mark state so visibility-resume logic doesn't fight the
+    // user's intentional pause from the lock screen.
+    state.playing = false;
+  });
   navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
   navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
   navigator.mediaSession.setActionHandler('seekto', e => { if (state.currentDuration) AUDIO.currentTime = e.seekTime; });
@@ -1156,15 +1178,20 @@ document.addEventListener('visibilitychange', () => {
     // Only attempt resume if we were playing when we left AND the audio
     // element actually got paused by iOS (not by the user).
     if (_wasPlayingBeforeHide && state.playing && AUDIO.paused) {
-      AUDIO.play().catch(() => {
-        // Stream URL may have expired (common after >30 min background);
-        // reload from Invidious.
+      // Try resuming the existing stream first (fastest, no re-fetch).
+      // If iOS dropped the buffer or the URL expired, play() rejects —
+      // fall back to a full stream reload from Invidious.
+      AUDIO.play().catch(err => {
+        console.warn('[BG resume] play() rejected:', err.message, '— reloading stream');
         if (state.currentTrack) loadStreamForTrack(state.currentTrack);
       });
     }
 
     _wasPlayingBeforeHide = false;
-  }, 300); // 300 ms grace period for iOS audio session to settle
+  }, 600); // 600 ms grace period — iOS needs ~500 ms to fully settle its
+           // AVAudioSession after an interruption. 300 ms was too short and
+           // caused our play() call to collide with iOS's own internal resume,
+           // producing the audible stutter/glitch on app switch.
 });
 
 /* ── SWIPE DOWN TO CLOSE NOW PLAYING ── */
