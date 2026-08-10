@@ -561,7 +561,7 @@ async function searchYouTube(query) {
           videoId: item.id.videoId,
           title:   decodeHTML(item.snippet.title),
           artist:  decodeHTML(item.snippet.channelTitle),
-          thumb:   item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url || '',
+          thumb:   `https://i.ytimg.com/vi/${item.id.videoId}/mqdefault.jpg`,
         }));
       }
     }
@@ -589,7 +589,9 @@ async function searchInvidious(query) {
         videoId: item.videoId,
         title:   item.title || '',
         artist:  item.author || '',
-        thumb:   (item.videoThumbnails?.find(t => t.quality === 'medium') || item.videoThumbnails?.[0])?.url || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
+        // Always use ytimg.com directly — Invidious proxies thumbnail URLs
+        // through its own domain which is blocked by the app's CSP.
+        thumb:   `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
       }));
     } catch (e) {
       console.warn(`[Invidious Search] ${base} failed:`, e.message);
@@ -632,42 +634,53 @@ async function loadFeaturedBanner() {
   const banner = el('featured-banner');
   if (!banner) return;
   const pick = FEATURED_BANNERS[Math.floor(Math.random() * FEATURED_BANNERS.length)];
+
+  let tracks = [];
+
+  // Try YouTube API first
   try {
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=3&q=${encodeURIComponent(pick.query)}&key=${state.apiKey}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('API error');
-    const data = await res.json();
-    const items = data.items || [];
-    if (!items.length) throw new Error('No results');
-    const track = {
-      videoId: items[0].id.videoId,
-      title: decodeHTML(items[0].snippet.title),
-      artist: decodeHTML(items[0].snippet.channelTitle),
-      thumb: items[0].snippet.thumbnails?.medium?.url || '',
-    };
-    const queue = items.map(i => ({
-      videoId: i.id.videoId,
-      title: decodeHTML(i.snippet.title),
-      artist: decodeHTML(i.snippet.channelTitle),
-      thumb: i.snippet.thumbnails?.medium?.url || '',
-    }));
-    banner.innerHTML = `
-      <div class="featured-card">
-        <img src="${esc(track.thumb)}" alt="${esc(track.title)}" />
-        <div class="featured-card-overlay">
-          <div class="featured-eyebrow">${esc(pick.eyebrow)}</div>
-          <div class="featured-title">${esc(pick.title)}</div>
-          <div class="featured-sub">${esc(pick.sub)}</div>
-        </div>
-      </div>`;
-    banner.querySelector('.featured-card').addEventListener('click', () => {
-      playTrack(track, queue, 0);
-      el('np-queue-name').textContent = pick.title;
-      openNowPlaying();
-    });
-  } catch {
-    banner.style.display = 'none';
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (res.ok) {
+      const data = await res.json();
+      const items = data.items || [];
+      if (items.length) {
+        tracks = items.map(i => ({
+          videoId: i.id.videoId,
+          title: decodeHTML(i.snippet.title),
+          artist: decodeHTML(i.snippet.channelTitle),
+          // Use ytimg directly — always reliable
+          thumb: `https://i.ytimg.com/vi/${i.id.videoId}/mqdefault.jpg`,
+        }));
+      }
+    }
+  } catch {}
+
+  // Fallback to Invidious search
+  if (!tracks.length) {
+    try {
+      const inv = await searchInvidious(pick.query);
+      tracks = inv.slice(0, 3);
+    } catch {}
   }
+
+  if (!tracks.length) { banner.style.display = 'none'; return; }
+
+  const track = tracks[0];
+  banner.innerHTML = `
+    <div class="featured-card">
+      <img src="${esc(track.thumb)}" alt="${esc(track.title)}" />
+      <div class="featured-card-overlay">
+        <div class="featured-eyebrow">${esc(pick.eyebrow)}</div>
+        <div class="featured-title">${esc(pick.title)}</div>
+        <div class="featured-sub">${esc(pick.sub)}</div>
+      </div>
+    </div>`;
+  banner.querySelector('.featured-card').addEventListener('click', () => {
+    playTrack(track, tracks, 0);
+    el('np-queue-name').textContent = pick.title;
+    openNowPlaying();
+  });
 }
 
 async function loadFeaturedPlaylists() {
@@ -679,7 +692,7 @@ async function loadFeaturedPlaylists() {
     card.className = 'featured-pl-card';
     card.innerHTML = `
       <div class="featured-pl-art">
-        <img src="https://img.youtube.com/vi/dQw4w9WgXcQ/mqdefault.jpg" alt="${esc(pl.name)}" />
+        <img src="https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg" alt="${esc(pl.name)}" data-pl-id="${esc(pl.id)}" />
         <div class="featured-pl-badge">${esc(pl.badge)}</div>
       </div>
       <div class="featured-pl-name">${esc(pl.name)}</div>
@@ -696,17 +709,42 @@ async function loadFeaturedPlaylistThumbs() {
   if (!row) return;
   for (let i = 0; i < FEATURED_PLAYLISTS.length; i++) {
     const pl = FEATURED_PLAYLISTS[i];
+    const card = row.children[i];
+    if (!card) continue;
+    const img = card.querySelector('img');
+    if (!img) continue;
+
+    // Try YouTube API first
+    let thumb = null;
     try {
       const url = `https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=${pl.id}&key=${state.apiKey}`;
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      const data = await res.json();
-      const thumb = data.items?.[0]?.snippet?.thumbnails?.medium?.url || data.items?.[0]?.snippet?.thumbnails?.default?.url;
-      if (thumb) {
-        const card = row.children[i];
-        if (card) { const img = card.querySelector('img'); if (img) img.src = thumb; }
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json();
+        const t = data.items?.[0]?.snippet?.thumbnails;
+        thumb = t?.medium?.url || t?.default?.url || null;
       }
     } catch {}
+
+    // Fallback: fetch first video ID from the playlist via Invidious,
+    // then build a direct ytimg thumbnail from that videoId.
+    if (!thumb) {
+      for (const base of INVIDIOUS_INSTANCES) {
+        try {
+          const url = `${base}/api/v1/playlists/${pl.id}?fields=videos`;
+          const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+          if (!res.ok) continue;
+          const data = await res.json();
+          const firstId = data?.videos?.[0]?.videoId;
+          if (firstId) {
+            thumb = `https://i.ytimg.com/vi/${firstId}/mqdefault.jpg`;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    if (thumb) img.src = thumb;
   }
 }
 
@@ -723,7 +761,7 @@ async function loadYouTubePlaylist(pl) {
         videoId: i.snippet.resourceId.videoId,
         title:   decodeHTML(i.snippet.title),
         artist:  decodeHTML(i.snippet.videoOwnerChannelTitle || i.snippet.channelTitle),
-        thumb:   i.snippet.thumbnails?.medium?.url || i.snippet.thumbnails?.default?.url || '',
+        thumb:   `https://i.ytimg.com/vi/${i.snippet.resourceId.videoId}/mqdefault.jpg`,
       }));
     if (!tracks.length) { toast('Empty playlist'); return; }
     playTrack(tracks[0], tracks, 0);
