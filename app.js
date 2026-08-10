@@ -1381,54 +1381,128 @@ function decodeHTML(str) {
 
 /* ── iOS BACKGROUND AUDIO KEEP-ALIVE ── */
 //
-// iOS interruption lifecycle:
-//   1. Screen lock / app switch  → iOS pauses the audio element and fires
-//      an "interruption" on the underlying AVAudioSession.
-//   2. Returning to the app      → iOS resumes the AVAudioSession, but it
-//      does NOT automatically call play() — we have to do that ourselves.
-//      However, we must wait until AFTER iOS has finished its own resume
-//      sequence; calling play() too early causes the "glitch" (a brief
-//      stutter as iOS drops our play() call and then re-issues its own).
+// The problem in full:
 //
-// Strategy:
-//   - On visibility:hidden  → note that we were playing, but do NOTHING
-//     to the audio element (let iOS manage the session).
-//   - On visibility:visible → use a short debounce (300 ms) so iOS finishes
-//     its internal resume first, then check if we still need to resume.
-//   - Re-establish mediaSession metadata every time we return (iOS sometimes
-//     clears the lock-screen widget on app switch).
+//   iOS gives a PWA's WebKit process a background audio "assertion" — a
+//   system-level token that lets JS keep running and lets the audio element
+//   actually produce sound while the screen is locked. This assertion is
+//   tied to the existence of an ACTIVE audio session. When you pause
+//   AUDIO and leave it paused for ~30 seconds with no audio activity at
+//   all, iOS decides the session is idle and terminates the assertion.
+//
+//   After that happens, AUDIO.play() is accepted without throwing — no
+//   error, no rejection — but produces no audio output. The lock-screen
+//   scrubber animates because iOS is moving it based on the last-known
+//   position, not actual playback. The audio device is simply gone.
+//   Opening the app brings it back because foreground apps always have a
+//   fresh audio session.
+//
+//   This is a documented WebKit/iOS limitation (WebKit bug #261858,
+//   Apple Developer Forums thread 762582) that Apple has not fixed as of
+//   iOS 18. It only affects PWAs in standalone mode, not Safari tabs.
+//
+// The fix — silent AudioContext keepalive:
+//
+//   We create an AudioContext with a ConstantSourceNode connected through
+//   a GainNode set to gain=0 (zero amplitude — completely inaudible).
+//   While AUDIO is paused, we start() this source so the AudioContext
+//   keeps ticking. iOS sees an active audio session and keeps the
+//   background assertion alive indefinitely.
+//
+//   When AUDIO resumes, we stop the keepalive (AudioContext CPU is
+//   negligible but there's no point running both simultaneously).
+//
+//   The AudioContext must be created in a user-gesture handler — we do
+//   it lazily on the first play() call, which is always user-initiated.
+//
+// Why ConstantSourceNode and not OscillatorNode:
+//   ConstantSourceNode with offset=0 and gain=0 produces a true DC
+//   signal at zero amplitude. It's purpose-built for exactly this use
+//   case and burns less CPU than OscillatorNode.
+
+let _silentCtx    = null;
+let _silentSource = null;
+let _silentGain   = null;
+
+function ensureSilentContext() {
+  if (_silentCtx) return;
+  try {
+    _silentCtx  = new (window.AudioContext || window.webkitAudioContext)();
+    _silentGain = _silentCtx.createGain();
+    _silentGain.gain.value = 0; // completely inaudible
+    _silentGain.connect(_silentCtx.destination);
+  } catch (e) {
+    console.warn('[KeepAlive] AudioContext unavailable:', e.message);
+  }
+}
+
+function startSilentKeepAlive() {
+  if (!_silentCtx) return;
+  stopSilentKeepAlive(); // stop any existing source first
+  try {
+    if (_silentCtx.state === 'suspended') _silentCtx.resume().catch(() => {});
+    _silentSource = _silentCtx.createConstantSource();
+    _silentSource.offset.value = 0;
+    _silentSource.connect(_silentGain);
+    _silentSource.start();
+    console.log('[KeepAlive] Silent keepalive started');
+  } catch (e) {
+    console.warn('[KeepAlive] start failed:', e.message);
+  }
+}
+
+function stopSilentKeepAlive() {
+  if (_silentSource) {
+    try { _silentSource.stop(); } catch {}
+    try { _silentSource.disconnect(); } catch {}
+    _silentSource = null;
+    console.log('[KeepAlive] Silent keepalive stopped');
+  }
+}
+
+// Hook into AUDIO events: keepalive runs while paused, stops while playing.
+// The ensureSilentContext() call on 'play' is safe because play() is always
+// triggered by a user gesture (tap), satisfying iOS's AudioContext policy.
+AUDIO.addEventListener('play', () => {
+  ensureSilentContext();
+  stopSilentKeepAlive();
+});
+AUDIO.addEventListener('pause',  () => { startSilentKeepAlive(); });
+AUDIO.addEventListener('ended',  () => { startSilentKeepAlive(); });
+
+// ── VISIBILITY CHANGE ──
+// With the keepalive active, the audio session stays alive during pause,
+// so lock-screen play works. The handler below handles the case where iOS
+// DID kill the session (e.g. after an interruption like a phone call) by
+// attempting a play() with stream-reload fallback on foreground.
 
 let _wasPlayingBeforeHide = false;
 let _resumeTimer = null;
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
-    // Snapshot playing state; do NOT touch AUDIO here.
     _wasPlayingBeforeHide = state.playing && !AUDIO.paused;
     if (_resumeTimer) { clearTimeout(_resumeTimer); _resumeTimer = null; }
     return;
   }
 
-  // visible — we're back in the foreground
   if (_resumeTimer) clearTimeout(_resumeTimer);
-
   _resumeTimer = setTimeout(() => {
     _resumeTimer = null;
 
     // Re-register mediaSession so the lock-screen widget re-appears
     if ('mediaSession' in navigator && state.currentTrack) {
       setupMediaSession(state.currentTrack);
-      if (state.playing) {
-        navigator.mediaSession.playbackState = 'playing';
-      }
+      if (state.playing) navigator.mediaSession.playbackState = 'playing';
     }
 
-    // Only attempt resume if we were playing when we left AND the audio
-    // element actually got paused by iOS (not by the user).
+    // Resume AudioContext if iOS suspended it during an interruption
+    if (_silentCtx && _silentCtx.state === 'suspended') {
+      _silentCtx.resume().catch(() => {});
+    }
+
+    // If we were playing when we left and iOS paused us, try to resume
     if (_wasPlayingBeforeHide && state.playing && AUDIO.paused) {
-      // Try resuming the existing stream first (fastest, no re-fetch).
-      // If iOS dropped the buffer or the URL expired, play() rejects —
-      // fall back to a full stream reload from Invidious.
       AUDIO.play().catch(err => {
         console.warn('[BG resume] play() rejected:', err.message, '— reloading stream');
         if (state.currentTrack) loadStreamForTrack(state.currentTrack);
@@ -1436,10 +1510,7 @@ document.addEventListener('visibilitychange', () => {
     }
 
     _wasPlayingBeforeHide = false;
-  }, 600); // 600 ms grace period — iOS needs ~500 ms to fully settle its
-           // AVAudioSession after an interruption. 300 ms was too short and
-           // caused our play() call to collide with iOS's own internal resume,
-           // producing the audible stutter/glitch on app switch.
+  }, 600); // 600 ms — iOS needs ~500 ms to settle AVAudioSession
 });
 
 /* ── SWIPE DOWN TO CLOSE NOW PLAYING ── */
