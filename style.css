@@ -12,7 +12,8 @@
   --text:        #F5F5F7;
   --text2:       rgba(245,245,247,.62);
   --text3:       rgba(245,245,247,.35);
-  --nav-h:       56px;
+  /* Nav height is driven by padding + env(safe-area-inset-bottom) directly
+     in each rule — no fixed variable, so iOS PWA env() always resolves. */
   --mini-h:      66px;
   --safe-top:    env(safe-area-inset-top, 0px);
   --safe-bot:    env(safe-area-inset-bottom, 0px);
@@ -143,8 +144,8 @@ button:active { -webkit-tap-highlight-color: transparent; }
   overflow-y: auto;
   overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
-  /* mini height + nav height + safe area + breathing room */
-  padding: 0 0 calc(var(--mini-h) + var(--nav-h) + var(--safe-bot) + 28px);
+  /* mini(66px) + gap(8px) + nav-content(58px) + safe-area + extra room(16px) */
+  padding: 0 0 calc(66px + 8px + 58px + env(safe-area-inset-bottom, 0px) + 16px);
   overscroll-behavior-y: contain;
   overscroll-behavior-x: none;
   touch-action: pan-y;
@@ -631,13 +632,17 @@ button:active { -webkit-tap-highlight-color: transparent; }
 .app-version { font-size: 12px; color: var(--text3); }
 
 /* ── BOTTOM NAV ── */
+/* Height is driven entirely by padding — no fixed height so env() always
+   resolves correctly in PWA standalone mode on iOS. The icon+label content
+   is ~48px; padding-top + padding-bottom + content = total nav height. */
 #bottom-nav {
   display: flex;
   justify-content: space-around;
   align-items: flex-start;
-  padding-top: 8px;
-  padding-bottom: calc(var(--safe-bot) + 4px);
-  height: calc(var(--nav-h) + var(--safe-bot));
+  padding-top: 10px;
+  /* env(safe-area-inset-bottom) covers the home indicator in PWA mode.
+     In browser Safari it is 0 so the nav stays compact there too. */
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 8px);
   background: rgba(13,13,15,.94);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -650,8 +655,8 @@ button:active { -webkit-tap-highlight-color: transparent; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
-  padding: 2px 16px;
+  gap: 3px;
+  padding: 0 16px;
   color: var(--text3);
   transition: color 0.2s, transform 0.15s var(--spring);
   min-width: 52px;
@@ -666,9 +671,11 @@ button:active { -webkit-tap-highlight-color: transparent; }
   position: fixed;
   left: 12px;
   right: 12px;
-  /* Sit just above the nav bar — nav-h is the fixed icon+label area,
-     safe-bot is the home indicator. Add 6px breathing room. */
-  bottom: calc(var(--nav-h) + var(--safe-bot) + 6px);
+  /* Sit just above the nav bar.
+     58px = nav content (10px padding-top + 24px icon + 3px gap + 11px label + 10px base)
+     env(safe-area-inset-bottom) = home indicator in PWA, 0 in browser.
+     8px = breathing room between mini player and nav. */
+  bottom: calc(58px + env(safe-area-inset-bottom, 0px) + 8px);
   height: var(--mini-h);
   background: rgba(36,36,44,.97);
   backdrop-filter: blur(28px);
@@ -1107,7 +1114,7 @@ button:active { -webkit-tap-highlight-color: transparent; }
 /* ── TOAST ── */
 .toast {
   position: fixed;
-  bottom: calc(var(--nav-h) + var(--mini-h) + var(--safe-bot) + 20px);
+  bottom: calc(58px + env(safe-area-inset-bottom, 0px) + 66px + 20px);
   left: 50%; transform: translateX(-50%) translateY(20px);
   background: rgba(50,50,60,.95);
   backdrop-filter: blur(12px);
@@ -1139,17 +1146,10 @@ button:active { -webkit-tap-highlight-color: transparent; }
 }
 
 /* ── PWA STANDALONE OVERRIDES ── */
-/* In standalone (installed PWA) mode the status bar & home indicator are
-   always present. We let safe-area-inset-* handle them — no extra nav
-   height needed. In regular Safari the URL bar eats space that makes the
-   fixed 84px nav look fine; in PWA it looks bloated, so we cap it. */
+/* env(safe-area-inset-bottom) handles the home indicator natively —
+   no variable overrides needed. Just tighten the album art size slightly
+   since we have the full screen without browser chrome. */
 @media all and (display-mode: standalone) {
-  :root {
-    --nav-h: 52px;
-  }
-
-  /* Slightly less breathing room on the art in standalone — we have the
-     full screen to work with but don't need as much margin */
   .np-art-wrap {
     width: min(calc(100vw - 56px), 310px);
     height: min(calc(100vw - 56px), 310px);
