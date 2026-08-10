@@ -9,8 +9,26 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#0D0D0F" />
   <meta name="description" content="Free music, no limits." />
-  <!-- Prevent URL bar showing in standalone mode -->
   <meta name="format-detection" content="telephone=no" />
+  <!--
+    Content-Security-Policy: connect-src is intentionally open for audio API calls.
+    All external fetches stay as fetch() calls — no <a href> navigations that would
+    trigger the browser's "leaving app" sheet or Safe Browsing interstitials.
+    Scripts are self-only; no inline eval.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self';
+    style-src 'self' 'unsafe-inline';
+    img-src 'self' data: https://i.ytimg.com https://img.youtube.com https://yt3.ggpht.com https://lh3.googleusercontent.com;
+    media-src blob: data: https: *;
+    connect-src https: *;
+    frame-src 'none';
+    object-src 'none';
+    base-uri 'self';
+    form-action 'self';
+    navigate-to 'self';
+  " />
   <title>Aspotï</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
