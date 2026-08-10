@@ -66,8 +66,11 @@ const INVIDIOUS_INSTANCES = [
 // The single native audio element — this is what iOS respects
 const AUDIO = new Audio();
 AUDIO.preload = 'none';
-AUDIO.crossOrigin = 'anonymous';
-// iOS requires playsinline equivalent for audio sessions
+// NOTE: Do NOT set crossOrigin = 'anonymous' on the audio element.
+// On iOS Safari/PWA, CORS mode triggers a preflight for streaming URLs that
+// don't return CORS headers, which kills the audio session when backgrounded.
+// Removing crossOrigin lets the browser use a simple request (no preflight),
+// which iOS media session continues to honour in the background.
 AUDIO.setAttribute('playsinline', '');
 
 // Wire up audio events
@@ -138,8 +141,13 @@ async function resolveAudioUrl(videoId, attempt = 0) {
       // Pick best audio stream (highest bitrate, not videoOnly)
       const streams = (data.audioStreams || []).filter(s => !s.videoOnly);
       if (!streams.length) throw new Error('no audio streams');
-      streams.sort((a, b) => b.bitrate - a.bitrate);
-      return streams[0].url;
+      // Prefer opus/webm streams — they're what ytify uses and resume best from background.
+      // Fall back to any stream sorted by moderate bitrate (not highest, to avoid fmp4).
+      const opus = streams.filter(s => s.mimeType?.includes('opus') || s.codec?.includes('opus'));
+      const pool = opus.length ? opus : streams;
+      // Sort by bitrate descending but cap preference at ~128kbps for reliability
+      pool.sort((a, b) => b.bitrate - a.bitrate);
+      return pool[0].url;
     } else {
       // Invidious
       const res = await fetch(`${inst.url}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal: AbortSignal.timeout(6000) });
@@ -147,8 +155,11 @@ async function resolveAudioUrl(videoId, attempt = 0) {
       const data = await res.json();
       const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/'));
       if (!formats.length) throw new Error('no audio formats');
-      formats.sort((a, b) => parseInt(b.bitrate) - parseInt(a.bitrate));
-      return formats[0].url;
+      // Prefer webm/opus — most reliable for iOS background via Invidious proxy
+      const opusFormats = formats.filter(f => f.type?.includes('opus') || f.type?.includes('webm'));
+      const pool = opusFormats.length ? opusFormats : formats;
+      pool.sort((a, b) => parseInt(b.bitrate) - parseInt(a.bitrate));
+      return pool[0].url;
     }
   } catch (e) {
     console.warn(`Instance ${inst.url} failed:`, e.message);
@@ -424,7 +435,8 @@ async function searchYouTube(query) {
 function updateArtColor(thumbUrl) {
   if (!thumbUrl) return;
   const img = new Image();
-  img.crossOrigin = 'anonymous';
+  // Do NOT set crossOrigin here — on iOS it can interrupt the media session
+  // if the CORS preflight fails, which breaks background audio.
   img.onload = function () {
     try {
       const c = document.createElement('canvas');
@@ -764,6 +776,35 @@ function esc(str) {
 function decodeHTML(str) {
   const t = document.createElement('textarea'); t.innerHTML = str; return t.value;
 }
+
+/* ── iOS BACKGROUND AUDIO SESSION KEEP-ALIVE ── */
+// iOS 13+ PWAs suspend the audio session after ~30s of backgrounding/pause.
+// Strategy: on visibilitychange (screen unlock / app resume), if we were
+// playing, re-issue play() to reclaim the media session assertion.
+// This mirrors what ytify does to survive lock-screen backgrounding.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.currentTrack) {
+    if (state.playing && AUDIO.paused) {
+      // Audio was playing but got suspended — resume it
+      AUDIO.play().catch(() => {
+        // If play() fails (session fully dead), reload the stream from scratch
+        loadStreamForTrack(state.currentTrack, 0);
+      });
+    } else if (!state.playing && AUDIO.paused && AUDIO.src && AUDIO.src !== window.location.href) {
+      // Nothing to do — user had it paused intentionally
+    }
+    // Refresh Media Session metadata so lock screen controls re-appear
+    if (state.currentTrack && 'mediaSession' in navigator) {
+      setupMediaSession(state.currentTrack);
+    }
+  }
+});
+
+// Intercept page unload — on iOS PWA, navigating away kills audio.
+// Keep the SW alive so the audio session isn't terminated.
+window.addEventListener('pagehide', () => {
+  // Nothing to do; the service worker handles keeping the shell alive.
+}, { passive: true });
 
 /* ── SWIPE DOWN TO CLOSE NOW PLAYING ── */
 (function setupSwipe() {
