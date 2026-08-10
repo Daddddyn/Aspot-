@@ -31,28 +31,22 @@ self.addEventListener('fetch', e => {
 
   const url = e.request.url;
 
-  // ── NEVER intercept audio streams or API calls ──
-  // These must go directly to network; any SW interception can prevent
-  // iOS from establishing/keeping its background audio session assertion.
+  // NEVER intercept audio streams, API calls, or YouTube CDN
+  // Passing these through the SW thread can block iOS media session assertions
   if (
+    url.includes('youtube.com/youtubei') ||
+    url.includes('googlevideo.com') ||
+    url.includes('googleapis.com') ||
     url.includes('pipedapi') ||
-    url.includes('pipedapi.') ||
     url.includes('invidious') ||
     url.includes('yewtu.be') ||
-    url.includes('googleapis.com') ||
-    url.includes('videoplayback') ||
-    url.includes('/api/v1/') ||
     url.includes('/streams/') ||
-    url.includes('googlevideo.com') ||
-    url.includes('ytimg.com')        // thumbnail images — let browser handle
+    url.includes('/api/v1/')
   ) {
-    // Passthrough: do NOT call e.respondWith() — browser handles natively.
-    // This is critical: calling e.respondWith(fetch(e.request)) still goes
-    // through the SW thread and can block/delay the media session on iOS.
-    return;
+    return; // Let browser handle natively — do NOT call e.respondWith()
   }
 
-  // ── Cache-first for app shell assets only ──
+  // Cache-first for app shell assets only
   e.respondWith(
     caches.match(e.request).then(cached => {
       if (cached) return cached;
@@ -62,10 +56,7 @@ self.addEventListener('fetch', e => {
           caches.open(CACHE).then(c => c.put(e.request, clone));
         }
         return res;
-      }).catch(() => {
-        // Return cached version if network fails for shell assets
-        return caches.match('./index.html');
-      });
+      }).catch(() => caches.match('./index.html'));
     })
   );
 });
