@@ -47,32 +47,20 @@ const save = {
    so iOS respects it for lock screen + background play.
    ════════════════════════════════════════════════════ */
 
-// ── InnerTube (YouTube's internal API) — primary source ──
-// CRITICAL: We use the "android_sdkless" variant (ANDROID client WITHOUT
-// androidSdkVersion). As of 2025-2026, including androidSdkVersion triggers
-// YouTube's PO Token requirement for audio-only streams, causing 403 errors
-// on every audio-only format (itag 140, 251, etc.) while muxed video works.
-// Removing androidSdkVersion bypasses this check entirely — this is the exact
-// same workaround used by yt-dlp as their default client. See:
-// https://github.com/Hexer10/youtube_explode_dart/pull/371
-// https://github.com/yt-dlp/yt-dlp/commit/309b03f
-const INNERTUBE_KEY = 'AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w';
-const INNERTUBE_URL = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`;
-
-// Piped/Invidious kept as fallback (they may or may not work depending on instance health)
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.moomoo.me',
-  'https://pa.il.ax',
-];
-
+// ── STREAM SOURCES ──
+// Based on reading ytify's EXACT source (src/lib/modules/getStreamData.ts):
+// ytify does NOT use InnerTube client-side at all.
+// It calls Invidious /api/v1/videos/:id which returns adaptiveFormats
+// with direct, ready-to-use audio stream URLs.
 const INVIDIOUS_INSTANCES = [
+  'https://yt.omada.cafe',            // ytify primary
+  'https://lekker.gay',               // ytify secondary
   'https://yewtu.be',
   'https://invidious.nerdvpn.de',
   'https://inv.nadeko.net',
   'https://invidious.privacyredirect.com',
+  'https://iv.datura.network',
+  'https://invidious.privacydev.net',
 ];
 
 // The single native audio element — this is what iOS respects
@@ -128,169 +116,86 @@ function onAudioError() {
   }
 }
 
-/* ── STREAM RESOLUTION ── */
+/* ── STREAM RESOLUTION ──
+   Matches ytify's EXACT approach from src/lib/modules/getStreamData.ts:
+   Call Invidious /api/v1/videos/:id → get adaptiveFormats → pick best audio.
+   Invidious instances return direct stream URLs that work immediately.
+   No client-side InnerTube calls needed. */
 
-// PRIMARY: YouTube InnerTube /youtubei/v1/player — ANDROID sdkless variant
-// DO NOT add androidSdkVersion to this context. Its presence triggers YouTube's
-// PO Token requirement for audio-only streams (403 on itag 140/251/etc).
-// The sdkless variant (no androidSdkVersion field) bypasses this — used by
-// yt-dlp as their default client since late 2025.
-async function resolveViaInnertube(videoId) {
-  try {
-    const res = await fetch(INNERTUBE_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: 'ANDROID',
-            clientVersion: '20.10.38',
-            // NOTE: No androidSdkVersion here — that field triggers PO Token
-            // enforcement for audio-only streams (403 errors). Omitting it
-            // is the "android_sdkless" trick used by yt-dlp.
-            userAgent: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
-            hl: 'en',
-            gl: 'US',
-          },
-        },
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+// Pick the best audio stream from Invidious adaptiveFormats.
+// ytify's preferredStream() logic: prefers opus (251/250/249) then aac (140/139).
+// The Invidious API uses 'type' field (not 'mimeType') for format info.
+function pickBestAudioStream(adaptiveFormats) {
+  const audioFormats = adaptiveFormats.filter(f => {
+    const t = f.type || f.mimeType || '';
+    return t.startsWith('audio');
+  });
+  if (!audioFormats.length) return null;
 
-    if (data.playabilityStatus?.status !== 'OK') {
-      throw new Error(`Not playable: ${data.playabilityStatus?.reason || data.playabilityStatus?.status}`);
-    }
+  // Prefer opus (better compression, works on all modern browsers)
+  // then m4a/aac (best iOS compat), then anything
+  const opus = audioFormats.filter(f => {
+    const t = f.type || f.mimeType || '';
+    return t.includes('opus') || t.includes('webm');
+  });
+  const aac = audioFormats.filter(f => {
+    const t = f.type || f.mimeType || '';
+    return t.includes('mp4') || t.includes('aac') || t.includes('mp4a');
+  });
 
-    const adaptiveFormats = data.streamingData?.adaptiveFormats || [];
-    // Audio-only streams (no width/height)
-    const audioFormats = adaptiveFormats.filter(f =>
-      f.mimeType?.startsWith('audio/') && !f.width
-    );
-    if (!audioFormats.length) throw new Error('no audio streams in InnerTube response');
+  // Sort each group by bitrate descending
+  const sortByBitrate = arr => arr.sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0));
+  sortByBitrate(opus);
+  sortByBitrate(aac);
 
-    // Prefer M4A (audio/mp4) for maximum iOS compatibility, then any audio
-    const m4a = audioFormats.filter(f => f.mimeType?.includes('audio/mp4'));
-    const pool = m4a.length ? m4a : audioFormats;
-    // Sort by bitrate descending, pick highest quality
-    pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    const chosen = pool[0];
-    console.log(`[InnerTube] Got stream: ${chosen.mimeType} @ ${chosen.bitrate}bps`);
-    return chosen.url;
-  } catch (e) {
-    console.warn('[InnerTube] Failed:', e.message);
-    return null;
-  }
+  // On iOS, AAC/m4a is more reliable; on other platforms prefer opus
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const preferred = isIOS
+    ? (aac[0] || opus[0])
+    : (opus[0] || aac[0]);
+
+  return preferred || audioFormats[0];
 }
 
-// FALLBACK A: InnerTube with IOS client
-// iOS client also doesn't require PO tokens and returns usable stream URLs.
-// Good secondary option when the android_sdkless client fails.
-async function resolveViaInnertubeIOS(videoId) {
-  try {
-    const res = await fetch(INNERTUBE_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: 'IOS',
-            clientVersion: '19.45.4',
-            deviceModel: 'iPhone16,2',
-            userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
-            hl: 'en',
-            gl: 'US',
-          },
-        },
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (data.playabilityStatus?.status !== 'OK') {
-      throw new Error(`Not playable: ${data.playabilityStatus?.reason || data.playabilityStatus?.status}`);
-    }
-    const adaptiveFormats = data.streamingData?.adaptiveFormats || [];
-    const audioFormats = adaptiveFormats.filter(f =>
-      f.mimeType?.startsWith('audio/') && !f.width
-    );
-    if (!audioFormats.length) throw new Error('no audio streams in IOS response');
-    const m4a = audioFormats.filter(f => f.mimeType?.includes('audio/mp4'));
-    const pool = m4a.length ? m4a : audioFormats;
-    pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    const chosen = pool[0];
-    console.log(`[InnerTube/IOS] Got stream: ${chosen.mimeType} @ ${chosen.bitrate}bps`);
-    return chosen.url;
-  } catch (e) {
-    console.warn('[InnerTube/IOS] Failed:', e.message);
-    return null;
+// Fetch from a single Invidious instance — this is fetchData() from ytify
+async function fetchFromInvidious(base, videoId) {
+  // Use the same endpoint ytify uses: /api/v1/videos/:id
+  const url = base
+    ? `${base}/api/v1/videos/${videoId}`
+    : `/api/v1/videos/${videoId}`; // empty base = local edge function fallback
+
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+
+  // ytify's exact validation checks:
+  if (!data || !('adaptiveFormats' in data) || !Array.isArray(data.adaptiveFormats)) {
+    throw new Error(data?.error || 'adaptiveFormats missing or not an array');
   }
+  if (!data.adaptiveFormats.every(f => typeof (f.type || f.mimeType) === 'string')) {
+    throw new Error('formats missing type property');
+  }
+  if (!data.adaptiveFormats.some(f => (f.type || f.mimeType || '').startsWith('audio'))) {
+    throw new Error('no audio streams found');
+  }
+  return data;
 }
 
-// FALLBACK B: Piped instances
-async function resolveViaPiped(videoId, attempt = 0) {
-  if (attempt >= PIPED_INSTANCES.length) return null;
-  const base = PIPED_INSTANCES[attempt];
-  try {
-    const res = await fetch(`${base}/streams/${videoId}`, { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const streams = (data.audioStreams || []).filter(s => !s.videoOnly);
-    if (!streams.length) throw new Error('no audio streams');
-    // Prefer m4a/mp4 for iOS, then opus
-    const m4a = streams.filter(s => s.mimeType?.includes('audio/mp4') || s.codec?.includes('mp4a'));
-    const pool = m4a.length ? m4a : streams;
-    pool.sort((a, b) => b.bitrate - a.bitrate);
-    return pool[0].url;
-  } catch (e) {
-    console.warn(`[Piped] ${base} failed:`, e.message);
-    return resolveViaPiped(videoId, attempt + 1);
-  }
-}
-
-// FALLBACK C: Invidious instances
-async function resolveViaInvidious(videoId, attempt = 0) {
-  if (attempt >= INVIDIOUS_INSTANCES.length) return null;
-  const base = INVIDIOUS_INSTANCES[attempt];
-  try {
-    const res = await fetch(`${base}/api/v1/videos/${videoId}?fields=adaptiveFormats`, { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const formats = (data.adaptiveFormats || []).filter(f => f.type?.startsWith('audio/'));
-    if (!formats.length) throw new Error('no audio formats');
-    const m4a = formats.filter(f => f.type?.includes('audio/mp4'));
-    const pool = m4a.length ? m4a : formats;
-    pool.sort((a, b) => parseInt(b.bitrate) - parseInt(a.bitrate));
-    return pool[0].url;
-  } catch (e) {
-    console.warn(`[Invidious] ${base} failed:`, e.message);
-    return resolveViaInvidious(videoId, attempt + 1);
-  }
-}
-
-// Master resolver: InnerTube (Android sdkless) → InnerTube (iOS) → Piped → Invidious
+// Master resolver — tries each Invidious instance in order, exactly like ytify
 async function resolveAudioUrl(videoId) {
-  // 1. Try ANDROID sdkless (no androidSdkVersion = no PO token needed)
-  let url = await resolveViaInnertube(videoId);
-  if (url) return url;
-
-  // 2. Try iOS client (also works without PO tokens)
-  console.warn('[resolveAudioUrl] Android sdkless failed, trying iOS client...');
-  url = await resolveViaInnertubeIOS(videoId);
-  if (url) return url;
-
-  // 3. Try Piped proxy instances
-  console.warn('[resolveAudioUrl] iOS InnerTube failed, trying Piped...');
-  url = await resolveViaPiped(videoId);
-  if (url) return url;
-
-  // 4. Try Invidious instances
-  console.warn('[resolveAudioUrl] Piped failed, trying Invidious...');
-  url = await resolveViaInvidious(videoId);
-  return url; // null if all fail
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const data = await fetchFromInvidious(base, videoId);
+      const stream = pickBestAudioStream(data.adaptiveFormats);
+      if (stream?.url) {
+        console.log(`[Invidious] ${base} → ${stream.type || stream.mimeType} @ ${stream.bitrate}bps`);
+        return stream.url;
+      }
+    } catch (e) {
+      console.warn(`[Invidious] ${base} failed:`, e.message);
+    }
+  }
+  return null;
 }
 
 async function loadStreamForTrack(track) {
@@ -305,20 +210,6 @@ async function loadStreamForTrack(track) {
   }
 
   // Only apply if this track is still the current one
-  if (state.currentTrack?.videoId !== track.videoId) return;
-
-  // Quick validation: HEAD the stream URL to catch 403/expired URLs before
-  // setting src (avoids a silent error with no useful feedback to the user)
-  try {
-    const check = await fetch(audioUrl, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
-    if (!check.ok && check.status === 403) {
-      console.warn('[loadStream] Stream URL returned 403 — may be expired or IP-restricted');
-      // Don't bail — some CDNs block HEAD but allow GET; try anyway
-    }
-  } catch {
-    // Network or timeout — proceed, the audio element will handle it
-  }
-
   if (state.currentTrack?.videoId !== track.videoId) return;
 
   AUDIO.src = audioUrl;
