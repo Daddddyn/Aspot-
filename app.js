@@ -144,7 +144,9 @@ async function resolveAudioUrl(videoId) {
       const stream = pickBestAudioStream(data.adaptiveFormats);
       if (stream?.url) {
         console.log(`[Invidious] ${base} → ${stream.type || stream.mimeType} @ ${stream.bitrate}bps`);
-        return stream.url;
+        // Return both the URL and the duration from the API — don't wait for
+        // loadedmetadata which is unreliable on iOS with remote stream URLs.
+        return { url: stream.url, duration: data.lengthSeconds || 0 };
       }
     } catch (e) {
       console.warn(`[Invidious] ${base} failed:`, e.message);
@@ -155,10 +157,19 @@ async function resolveAudioUrl(videoId) {
 
 async function loadStreamForTrack(track) {
   showLoadingState(true);
-  const audioUrl = await resolveAudioUrl(track.videoId);
-  if (!audioUrl) { showLoadingState(false); toast('No audio source found — check your connection'); return; }
+  const result = await resolveAudioUrl(track.videoId);
+  if (!result) { showLoadingState(false); toast('No audio source found — check your connection'); return; }
   if (state.currentTrack?.videoId !== track.videoId) return;
-  AUDIO.src = audioUrl;
+
+  // Set duration immediately from API metadata — don't wait for loadedmetadata.
+  // Invidious always returns lengthSeconds; this is far more reliable on iOS
+  // where loadedmetadata often fires late or with Infinity for stream URLs.
+  if (result.duration > 0) {
+    state.currentDuration = result.duration;
+    el('np-duration').textContent = fmtTime(result.duration);
+  }
+
+  AUDIO.src = result.url;
   AUDIO.volume = state.volumeLevel / 100;
   AUDIO.load();
   AUDIO.play().catch(e => { console.warn('play() blocked:', e); showLoadingState(false); updatePlayIcons(false); });
@@ -697,19 +708,26 @@ function updatePlayIcons(playing) {
 /* ── PAGE NAVIGATION ── */
 function switchPage(pageId) {
   const pages = document.querySelectorAll('.page');
-  const current = document.querySelector('.page.active');
-  if (current && current.id !== pageId) {
-    current.classList.add('prev');
-    setTimeout(() => current.classList.remove('prev', 'active'), 300);
-  }
-  pages.forEach(p => { if (p.id !== pageId) p.classList.remove('active'); });
+
+  // Fully reset every page that isn't the target — clear ALL class/style state
+  // so stale transitions never leave a page blocking touches.
+  pages.forEach(p => {
+    if (p.id !== pageId) {
+      p.classList.remove('active', 'prev');
+      p.style.display = 'none';
+      p.style.pointerEvents = 'none';
+    }
+  });
+
   const next = el(pageId);
   if (next) {
     next.style.display = 'flex';
-    // Force reflow
+    next.style.pointerEvents = '';
+    // Force reflow so the transition fires correctly
     next.offsetHeight;
     next.classList.add('active');
   }
+
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === pageId));
   const titles = { 'page-home':'Listen Now', 'page-search':'Search', 'page-library':'Library', 'page-settings':'Settings' };
   el('page-title').textContent = titles[pageId] || '';
