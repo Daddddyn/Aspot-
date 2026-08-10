@@ -47,9 +47,15 @@ const save = {
    so iOS respects it for lock screen + background play.
    ════════════════════════════════════════════════════ */
 
-// ── InnerTube (YouTube's internal API) — primary source, same as ytify ──
-// The ANDROID client returns plain URLs (no signature cipher needed) and
-// works reliably across regions. Key is public and non-rotating.
+// ── InnerTube (YouTube's internal API) — primary source ──
+// CRITICAL: We use the "android_sdkless" variant (ANDROID client WITHOUT
+// androidSdkVersion). As of 2025-2026, including androidSdkVersion triggers
+// YouTube's PO Token requirement for audio-only streams, causing 403 errors
+// on every audio-only format (itag 140, 251, etc.) while muxed video works.
+// Removing androidSdkVersion bypasses this check entirely — this is the exact
+// same workaround used by yt-dlp as their default client. See:
+// https://github.com/Hexer10/youtube_explode_dart/pull/371
+// https://github.com/yt-dlp/yt-dlp/commit/309b03f
 const INNERTUBE_KEY = 'AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w';
 const INNERTUBE_URL = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}&prettyPrint=false`;
 
@@ -124,9 +130,11 @@ function onAudioError() {
 
 /* ── STREAM RESOLUTION ── */
 
-// PRIMARY: YouTube InnerTube /youtubei/v1/player with ANDROID client
-// This is the same method ytify uses. The ANDROID client returns plain,
-// ready-to-use stream URLs with no signature deciphering required.
+// PRIMARY: YouTube InnerTube /youtubei/v1/player — ANDROID sdkless variant
+// DO NOT add androidSdkVersion to this context. Its presence triggers YouTube's
+// PO Token requirement for audio-only streams (403 on itag 140/251/etc).
+// The sdkless variant (no androidSdkVersion field) bypasses this — used by
+// yt-dlp as their default client since late 2025.
 async function resolveViaInnertube(videoId) {
   try {
     const res = await fetch(INNERTUBE_URL, {
@@ -137,9 +145,11 @@ async function resolveViaInnertube(videoId) {
         context: {
           client: {
             clientName: 'ANDROID',
-            clientVersion: '19.09.37',
-            androidSdkVersion: 30,
-            userAgent: 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+            clientVersion: '20.10.38',
+            // NOTE: No androidSdkVersion here — that field triggers PO Token
+            // enforcement for audio-only streams (403 errors). Omitting it
+            // is the "android_sdkless" trick used by yt-dlp.
+            userAgent: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
             hl: 'en',
             gl: 'US',
           },
@@ -175,7 +185,52 @@ async function resolveViaInnertube(videoId) {
   }
 }
 
-// FALLBACK A: Piped instances
+// FALLBACK A: InnerTube with IOS client
+// iOS client also doesn't require PO tokens and returns usable stream URLs.
+// Good secondary option when the android_sdkless client fails.
+async function resolveViaInnertubeIOS(videoId) {
+  try {
+    const res = await fetch(INNERTUBE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: 'IOS',
+            clientVersion: '19.45.4',
+            deviceModel: 'iPhone16,2',
+            userAgent: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.playabilityStatus?.status !== 'OK') {
+      throw new Error(`Not playable: ${data.playabilityStatus?.reason || data.playabilityStatus?.status}`);
+    }
+    const adaptiveFormats = data.streamingData?.adaptiveFormats || [];
+    const audioFormats = adaptiveFormats.filter(f =>
+      f.mimeType?.startsWith('audio/') && !f.width
+    );
+    if (!audioFormats.length) throw new Error('no audio streams in IOS response');
+    const m4a = audioFormats.filter(f => f.mimeType?.includes('audio/mp4'));
+    const pool = m4a.length ? m4a : audioFormats;
+    pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const chosen = pool[0];
+    console.log(`[InnerTube/IOS] Got stream: ${chosen.mimeType} @ ${chosen.bitrate}bps`);
+    return chosen.url;
+  } catch (e) {
+    console.warn('[InnerTube/IOS] Failed:', e.message);
+    return null;
+  }
+}
+
+// FALLBACK B: Piped instances
 async function resolveViaPiped(videoId, attempt = 0) {
   if (attempt >= PIPED_INSTANCES.length) return null;
   const base = PIPED_INSTANCES[attempt];
@@ -196,7 +251,7 @@ async function resolveViaPiped(videoId, attempt = 0) {
   }
 }
 
-// FALLBACK B: Invidious instances
+// FALLBACK C: Invidious instances
 async function resolveViaInvidious(videoId, attempt = 0) {
   if (attempt >= INVIDIOUS_INSTANCES.length) return null;
   const base = INVIDIOUS_INSTANCES[attempt];
@@ -216,15 +271,23 @@ async function resolveViaInvidious(videoId, attempt = 0) {
   }
 }
 
-// Master resolver: InnerTube → Piped → Invidious
+// Master resolver: InnerTube (Android sdkless) → InnerTube (iOS) → Piped → Invidious
 async function resolveAudioUrl(videoId) {
+  // 1. Try ANDROID sdkless (no androidSdkVersion = no PO token needed)
   let url = await resolveViaInnertube(videoId);
   if (url) return url;
 
-  console.warn('[resolveAudioUrl] InnerTube failed, trying Piped...');
+  // 2. Try iOS client (also works without PO tokens)
+  console.warn('[resolveAudioUrl] Android sdkless failed, trying iOS client...');
+  url = await resolveViaInnertubeIOS(videoId);
+  if (url) return url;
+
+  // 3. Try Piped proxy instances
+  console.warn('[resolveAudioUrl] iOS InnerTube failed, trying Piped...');
   url = await resolveViaPiped(videoId);
   if (url) return url;
 
+  // 4. Try Invidious instances
   console.warn('[resolveAudioUrl] Piped failed, trying Invidious...');
   url = await resolveViaInvidious(videoId);
   return url; // null if all fail
@@ -242,6 +305,20 @@ async function loadStreamForTrack(track) {
   }
 
   // Only apply if this track is still the current one
+  if (state.currentTrack?.videoId !== track.videoId) return;
+
+  // Quick validation: HEAD the stream URL to catch 403/expired URLs before
+  // setting src (avoids a silent error with no useful feedback to the user)
+  try {
+    const check = await fetch(audioUrl, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
+    if (!check.ok && check.status === 403) {
+      console.warn('[loadStream] Stream URL returned 403 — may be expired or IP-restricted');
+      // Don't bail — some CDNs block HEAD but allow GET; try anyway
+    }
+  } catch {
+    // Network or timeout — proceed, the audio element will handle it
+  }
+
   if (state.currentTrack?.videoId !== track.videoId) return;
 
   AUDIO.src = audioUrl;
