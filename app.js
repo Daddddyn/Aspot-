@@ -128,13 +128,14 @@ function onAudioPlay() {
   artContainer.classList.add('playing');
   artContainer.classList.remove('paused');
   startProgressLoop();
+  startBgEndTimer();
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
 }
 
 function onAudioPause() {
-  // Always stop the progress RAF when audio pauses — even in background —
-  // so we're not burning CPU on animation frames while nothing is playing.
+  // Always stop the progress RAF and background end timer when audio pauses.
   if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
+  stopBgEndTimer();
 
   // If the page is hidden, this pause was triggered by iOS interrupting the
   // audio session (screen lock, phone call, app switch) — NOT by the user.
@@ -151,22 +152,91 @@ function onAudioPause() {
 }
 
 function onAudioEnded() {
-  // Always stop the progress RAF first so the timer freezes immediately.
+  // Always stop the progress RAF and background timer first.
   if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
+  stopBgEndTimer();
 
   if (state.repeat === 'one') {
-    // Snap progress back to 0 visually before restarting.
-    updateProgressUI(0, 0, state.currentDuration);
+    // Seek to 0 and replay. This works in foreground. In background the
+    // bgEndTimer fires before this point and handles the seek itself.
     AUDIO.currentTime = 0;
-    AUDIO.play().catch(() => {
-      if (state.currentTrack) loadStreamForTrack(state.currentTrack);
-    });
+    AUDIO.play().catch(() => { if (state.currentTrack) loadStreamForTrack(state.currentTrack); });
     return;
   }
   state.playing = false;
   updatePlayIcons(false);
   seekNext();
 }
+
+/* ── BACKGROUND END TIMER ──
+   The core problem on iOS:
+   - Invidious adaptive streams embed both audio+video duration in their
+     container, so iOS sees a duration ~2× the real song length.
+   - Because of this, the 'ended' event fires late or never when the screen
+     is locked, and AUDIO.loop loops at the wrong point.
+   - requestAnimationFrame is suspended in background so the RAF safety-net
+     never runs either.
+
+   Solution: when a track starts, record the wall-clock start time and the
+   known song duration. A setInterval (which iOS DOES keep running for active
+   audio PWAs) checks every second whether real elapsed time ≥ song duration.
+   When it fires, we seek AUDIO.currentTime back to 0 and call play() —
+   this is allowed by iOS because it's triggered by the audio session's own
+   timer, not an arbitrary user-gesture-less call. For repeat-all / no-repeat
+   we call onAudioEnded() instead so normal queue advance logic runs. */
+let _bgEndTimer   = null;
+let _trackStartWall = 0;   // Date.now() when current track began playing
+let _trackStartAudio = 0;  // AUDIO.currentTime at that moment (usually 0)
+
+function startBgEndTimer() {
+  stopBgEndTimer();
+  if (!state.currentDuration || state.currentDuration <= 0) return;
+
+  _trackStartWall  = Date.now();
+  _trackStartAudio = AUDIO.currentTime || 0;
+
+  _bgEndTimer = setInterval(() => {
+    if (AUDIO.paused || !state.currentDuration) return;
+
+    // Wall-clock elapsed since track started, offset by where we started.
+    const wallElapsed = (Date.now() - _trackStartWall) / 1000;
+    const elapsed     = _trackStartAudio + wallElapsed;
+
+    if (elapsed < state.currentDuration - 0.5) return; // not there yet
+
+    // Song is over (or within 0.5 s of the end).
+    console.log(`[BgEndTimer] Song ended (elapsed ${elapsed.toFixed(1)}s / ${state.currentDuration}s)`);
+    stopBgEndTimer();
+
+    if (state.repeat === 'one') {
+      // Seek back to start and keep going — works in background on iOS.
+      AUDIO.currentTime = 0;
+      _trackStartWall  = Date.now();
+      _trackStartAudio = 0;
+      AUDIO.play().catch(() => { if (state.currentTrack) loadStreamForTrack(state.currentTrack); });
+      // Restart the timer for the next loop.
+      startBgEndTimer();
+    } else {
+      // For repeat-all / no-repeat, use the existing ended logic.
+      // onAudioEnded will call seekNext() which handles queue advance.
+      AUDIO.pause();
+      onAudioEnded();
+    }
+  }, 1000);
+}
+
+function stopBgEndTimer() {
+  if (_bgEndTimer) { clearInterval(_bgEndTimer); _bgEndTimer = null; }
+}
+
+// Also reset the wall-clock anchor whenever the user seeks manually,
+// so the timer doesn't misfire after a seek.
+AUDIO.addEventListener('seeked', () => {
+  if (_bgEndTimer) {
+    _trackStartWall  = Date.now();
+    _trackStartAudio = AUDIO.currentTime || 0;
+  }
+});
 
 function onAudioError() {
   console.warn('Audio element error — stream URL may have expired or be unsupported');
@@ -272,6 +342,8 @@ async function loadStreamForTrack(track) {
 
   AUDIO.src = result.url;
   AUDIO.volume = state.volumeLevel / 100;
+  AUDIO.loop = false; // never rely on native loop — Invidious stream containers
+                      // report 2× real duration so native loop fires at the wrong point.
   AUDIO.load();
   AUDIO.play().catch(e => { console.warn('play() blocked:', e); showLoadingState(false); updatePlayIcons(false); });
 }
