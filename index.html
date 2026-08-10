@@ -2,12 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Aspotï" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#0D0D0F" />
   <meta name="description" content="Free music, no limits." />
+  <!-- Prevent URL bar showing in standalone mode -->
+  <meta name="format-detection" content="telephone=no" />
   <title>Aspotï</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
@@ -15,7 +18,6 @@
 </head>
 <body>
 
-<!-- App Shell -->
 <div id="app">
 
   <!-- Header -->
@@ -44,7 +46,7 @@
   <!-- Pages -->
   <main id="pages">
 
-    <!-- ── HOME PAGE ── -->
+    <!-- HOME PAGE -->
     <section class="page active" id="page-home">
       <div class="page-scroll">
         <div class="section-header">
@@ -52,10 +54,40 @@
           <span class="greeting" id="greeting-text"></span>
         </div>
 
+        <!-- Featured / Discover Banner -->
+        <div class="featured-banner" id="featured-banner">
+          <div class="featured-loading">
+            <div class="featured-shimmer"></div>
+          </div>
+        </div>
+
         <div class="quick-picks">
           <h3 class="section-label">Recently Played</h3>
           <div class="recent-grid" id="recent-grid">
             <div class="empty-state-small">Start searching to build your history</div>
+          </div>
+        </div>
+
+        <!-- Trending by Genre -->
+        <div class="genre-section" id="genre-section">
+          <div class="genre-header">
+            <h3 class="section-label" style="padding:0">Trending Music</h3>
+            <div class="genre-pills" id="genre-pills"></div>
+          </div>
+          <div class="trending-row" id="trending-row">
+            <div class="trending-shimmer-row">
+              <div class="track-shimmer"></div>
+              <div class="track-shimmer"></div>
+              <div class="track-shimmer"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Popular Playlists -->
+        <div class="quick-picks">
+          <h3 class="section-label">Popular Playlists</h3>
+          <div class="playlist-row" id="featured-playlists-row">
+            <div class="empty-state-small" style="padding:8px 0">Loading…</div>
           </div>
         </div>
 
@@ -72,10 +104,12 @@
             <div class="empty-state-small">Like songs to see them here</div>
           </div>
         </div>
+
+        <div style="height:8px"></div>
       </div>
     </section>
 
-    <!-- ── SEARCH PAGE ── -->
+    <!-- SEARCH PAGE -->
     <section class="page" id="page-search">
       <div class="page-scroll">
         <div class="search-box-wrap">
@@ -109,7 +143,7 @@
       </div>
     </section>
 
-    <!-- ── LIBRARY PAGE ── -->
+    <!-- LIBRARY PAGE -->
     <section class="page" id="page-library">
       <div class="page-scroll">
         <div class="section-header">
@@ -152,7 +186,7 @@
       </div>
     </section>
 
-    <!-- ── SETTINGS PAGE ── -->
+    <!-- SETTINGS PAGE -->
     <section class="page" id="page-settings">
       <div class="page-scroll">
         <div class="section-header">
@@ -180,7 +214,7 @@
           <div class="settings-about">
             <div class="app-name-big">Aspotï</div>
             <div class="app-tagline">Free music, no limits.</div>
-            <div class="app-version">v1.0.0 · Made by your app suite</div>
+            <div class="app-version">Version 3.0 · YouTube-powered</div>
           </div>
         </div>
       </div>
@@ -192,7 +226,8 @@
   <nav id="bottom-nav">
     <button class="nav-btn active" data-page="page-home" aria-label="Home">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-        <path d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M3 9.5L12 3l9 6.5V20a1 1 0 01-1 1H4a1 1 0 01-1-1V9.5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" fill="none"/>
+        <path d="M9 21V12h6v9" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
       </svg>
       <span>Home</span>
     </button>
@@ -205,23 +240,24 @@
     </button>
     <button class="nav-btn" data-page="page-library" aria-label="Library">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-        <path d="M3 7h18M3 12h18M3 17h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-        <circle cx="19" cy="17" r="3" fill="currentColor" stroke="none"/>
-        <path d="M19 14V8l3-1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        <rect x="3" y="3" width="7" height="18" rx="1" stroke="currentColor" stroke-width="1.8"/>
+        <rect x="14" y="3" width="7" height="10" rx="1" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M14 17l3 3 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       <span>Library</span>
     </button>
     <button class="nav-btn" data-page="page-settings" aria-label="Settings">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
         <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8"/>
-        <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
       </svg>
       <span>Settings</span>
     </button>
   </nav>
 
   <!-- Mini Player -->
-  <div id="mini-player" class="hidden" role="button" tabindex="0" aria-label="Open now playing">
+  <div id="mini-player" class="hidden">
+    <div class="mini-progress-bar" id="mini-progress-bar"></div>
     <div class="mini-art">
       <img id="mini-art-img" src="" alt="" />
     </div>
@@ -230,13 +266,13 @@
       <div class="mini-artist" id="mini-artist">—</div>
     </div>
     <div class="mini-controls">
-      <button class="icon-btn like-btn mini-like" id="mini-like-btn" aria-label="Like">
+      <button class="icon-btn mini-like" id="mini-like-btn" aria-label="Like">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
           <path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
         </svg>
       </button>
       <button class="icon-btn" id="mini-play-btn" aria-label="Play/Pause">
-        <svg id="mini-play-icon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+        <svg id="mini-play-icon" width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
           <path d="M8 5v14l11-7z"/>
         </svg>
       </button>
@@ -250,7 +286,7 @@
 
 </div><!-- /app -->
 
-<!-- ── NOW PLAYING SHEET ── -->
+<!-- NOW PLAYING SHEET -->
 <div id="now-playing-sheet" class="sheet hidden">
   <div class="sheet-bg" id="sheet-bg-blur"></div>
   <div class="sheet-handle"></div>
@@ -259,7 +295,7 @@
     <div class="np-header">
       <button class="icon-btn" id="np-close" aria-label="Minimize">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-          <path d="M19 15l-7-7-7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M19 15l-7-7-7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </button>
       <div class="np-header-info">
@@ -293,7 +329,10 @@
     </div>
 
     <div class="np-progress-wrap">
-      <input type="range" id="np-progress" class="progress-slider" min="0" max="100" value="0" step="0.1" aria-label="Seek" />
+      <div class="progress-track" id="progress-track">
+        <div class="progress-fill" id="progress-fill"></div>
+        <div class="progress-thumb" id="progress-thumb"></div>
+      </div>
       <div class="np-times">
         <span id="np-current">0:00</span>
         <span id="np-duration">0:00</span>
@@ -313,15 +352,12 @@
       </button>
       <button class="icon-btn play-pause-btn" id="np-play" aria-label="Play/Pause">
         <div class="pp-circle">
-          <!-- Play icon (shown when paused) -->
           <svg id="pp-play" width="26" height="26" viewBox="0 0 24 24" fill="#0D0D0F">
             <path d="M6 4.75v14.5a.75.75 0 001.16.627l11.5-7.25a.75.75 0 000-1.254L7.16 4.123A.75.75 0 006 4.75z"/>
           </svg>
-          <!-- Pause icon (shown when playing) -->
           <svg id="pp-pause" width="26" height="26" viewBox="0 0 24 24" fill="#0D0D0F" style="display:none">
             <path d="M6 5a1 1 0 011-1h2a1 1 0 011 1v14a1 1 0 01-1 1H7a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h2a1 1 0 011 1v14a1 1 0 01-1 1h-2a1 1 0 01-1-1V5z"/>
           </svg>
-          <!-- Loading spinner (shown while resolving audio URL) -->
           <svg id="pp-spin" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#0D0D0F" stroke-width="2.5" stroke-linecap="round" style="display:none;animation:spin-pp .8s linear infinite">
             <path d="M12 2a10 10 0 010 20" opacity=".25"/>
             <path d="M12 2a10 10 0 0110 10"/>
@@ -341,9 +377,12 @@
     </div>
 
     <div class="np-volume-wrap">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" opacity=".5"><path d="M11 5L6 9H2v6h4l5 4V5zM15.54 8.46a5 5 0 010 7.07M19.07 4.93a10 10 0 010 14.14" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
-      <input type="range" id="np-volume" class="volume-slider" min="0" max="100" value="80" step="1" aria-label="Volume" />
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".9"><path d="M11 5L6 9H2v6h4l5 4V5zM15.54 8.46a5 5 0 010 7.07M19.07 4.93a10 10 0 010 14.14"/></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" opacity=".5"><path d="M11 5L6 9H2v6h4l5 4V5z" fill="currentColor"/></svg>
+      <div class="volume-track" id="volume-track">
+        <div class="volume-fill" id="volume-fill"></div>
+        <div class="volume-thumb" id="volume-thumb"></div>
+      </div>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" opacity=".9"><path d="M11 5L6 9H2v6h4l5 4V5z" fill="currentColor"/><path d="M15.54 8.46a5 5 0 010 7.07M19.07 4.93a10 10 0 010 14.14" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
     </div>
 
     <div class="np-footer">
@@ -357,8 +396,7 @@
   </div>
 </div>
 
-<!-- ── MODALS ── -->
-<!-- New Playlist Modal -->
+<!-- MODALS -->
 <div id="modal-new-playlist" class="modal-overlay hidden">
   <div class="modal-card">
     <div class="modal-title">New Playlist</div>
@@ -370,7 +408,6 @@
   </div>
 </div>
 
-<!-- Add to Playlist Modal -->
 <div id="modal-add-to-playlist" class="modal-overlay hidden">
   <div class="modal-card">
     <div class="modal-title">Add to Playlist</div>
@@ -381,7 +418,7 @@
   </div>
 </div>
 
-<!-- Playlist Detail Page (overlay) -->
+<!-- Playlist Detail Page -->
 <div id="playlist-detail" class="page-overlay hidden">
   <div class="overlay-header">
     <button class="icon-btn" id="pl-back" aria-label="Back">
