@@ -103,17 +103,20 @@ function onAudioPause() {
 }
 
 function onAudioEnded() {
+  // Always stop the progress RAF first so the timer freezes immediately.
+  if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
+
   if (state.repeat === 'one') {
-    // Restart immediately — do NOT set state.playing = false first or the
-    // progress loop and play-icon will flicker off before the replay begins.
+    // Snap progress back to 0 visually before restarting.
+    updateProgressUI(0, 0, state.currentDuration);
     AUDIO.currentTime = 0;
     AUDIO.play().catch(() => {
-      // If play() is blocked (rare on desktop), reload the stream cleanly
       if (state.currentTrack) loadStreamForTrack(state.currentTrack);
     });
     return;
   }
   state.playing = false;
+  updatePlayIcons(false);
   seekNext();
 }
 
@@ -278,14 +281,24 @@ function startProgressLoop() {
   if (progressRAF) cancelAnimationFrame(progressRAF);
   function tick() {
     if (!state.playing) return;
-    const cur = AUDIO.currentTime || 0;
+    const raw = AUDIO.currentTime || 0;
     // Always use the API-supplied duration (state.currentDuration).
-    // AUDIO.duration can be doubled for Invidious adaptive streams on iOS.
+    // AUDIO.duration can be doubled for Invidious adaptive streams on iOS,
+    // so the 'ended' event may never fire even though the song is over.
     const dur = state.currentDuration > 0 ? state.currentDuration : 0;
+    // Clamp displayed time so it never runs past the real song length.
+    const cur = dur > 0 ? Math.min(raw, dur) : raw;
     const pct = dur ? (cur / dur) * 100 : 0;
-    updateProgressUI(pct, cur, state.currentDuration);
+    updateProgressUI(pct, cur, dur);
     if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && dur > 0) {
       try { navigator.mediaSession.setPositionState({ duration: dur, playbackRate: 1, position: cur }); } catch {}
+    }
+    // Safety net: if the stream has played past the known song duration by more
+    // than 1 second, the 'ended' event is never coming — trigger it manually.
+    if (dur > 0 && raw >= dur + 1 && !AUDIO.paused) {
+      AUDIO.pause();
+      onAudioEnded();
+      return;
     }
     progressRAF = requestAnimationFrame(tick);
   }
