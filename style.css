@@ -32,23 +32,28 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html {
   height: 100%;
-  background: var(--bg);
-  /* Prevent bounce scroll showing white background */
-  overflow: hidden;
+  /* position:fixed + width:100% locks the viewport so Safari's URL bar
+     can't cause layout shifts. Combined with 100dvh on #app, this is
+     the correct way to get full-screen feel in Safari without adding to
+     Home Screen. */
   position: fixed;
   width: 100%;
+  background: var(--bg);
+  overflow: hidden;
 }
 body {
   font-family: var(--font);
   background: var(--bg);
   color: var(--text);
+  /* Use fill-available so body fills exactly the visible Safari viewport,
+     not the full screen including the hidden URL bar area. */
   height: 100%;
+  min-height: -webkit-fill-available;
   width: 100%;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
   user-select: none;
-  /* Prevent horizontal scroll/swipe on the page */
   touch-action: pan-y;
   overscroll-behavior: none;
 }
@@ -83,11 +88,14 @@ button:active { -webkit-tap-highlight-color: transparent; }
 #app {
   display: flex;
   flex-direction: column;
+  /* 100dvh = dynamic viewport height — shrinks when Safari URL bar is visible.
+     This keeps all content inside the visible window so nothing hides behind
+     the URL bar or the home indicator. The fallback 100vh is for older browsers. */
   height: 100dvh;
-  height: 100vh;
+  height: -webkit-fill-available; /* Safari 14 and earlier */
+  max-height: 100dvh;
   overflow: hidden;
   padding-top: var(--safe-top);
-  /* Also prevent page-level overscroll */
   overscroll-behavior: none;
 }
 
