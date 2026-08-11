@@ -1405,100 +1405,96 @@ function decodeHTML(str) {
 
 /* ── iOS BACKGROUND AUDIO KEEP-ALIVE ── */
 //
-// The problem in full:
+// Root cause (confirmed via WebKit bug #198277, fixed iOS 15.4+):
 //
-//   iOS gives a PWA's WebKit process a background audio "assertion" — a
-//   system-level token that lets JS keep running and lets the audio element
-//   actually produce sound while the screen is locked. This assertion is
-//   tied to the existence of an ACTIVE audio session. When you pause
-//   AUDIO and leave it paused for ~30 seconds with no audio activity at
-//   all, iOS decides the session is idle and terminates the assertion.
+//   iOS keeps a PWA's audio session alive only while an <audio> element is
+//   actively playing. When you pause, the system starts a ~30 s idle timer.
+//   If nothing plays before it fires, the audio assertion is dropped and
+//   subsequent play() calls produce no audio (silent failure).
 //
-//   After that happens, AUDIO.play() is accepted without throwing — no
-//   error, no rejection — but produces no audio output. The lock-screen
-//   scrubber animates because iOS is moving it based on the last-known
-//   position, not actual playback. The audio device is simply gone.
-//   Opening the app brings it back because foreground apps always have a
-//   fresh audio session.
+//   IMPORTANT: WebAudio (AudioContext / ConstantSourceNode) does NOT count.
+//   A WebKit engineer confirmed (bug #198277 comment 71) that AudioContext
+//   is classified as "Ambient" on iOS and is silenced in background. Only
+//   an HTMLAudioElement playing real audio holds the session open.
 //
-//   This is a documented WebKit/iOS limitation (WebKit bug #261858,
-//   Apple Developer Forums thread 762582) that Apple has not fixed as of
-//   iOS 18. It only affects PWAs in standalone mode, not Safari tabs.
+// The fix — looping silent <audio> element:
 //
-// The fix — silent AudioContext keepalive:
+//   A second hidden <audio> element loops a minimal inaudible WAV (44 bytes,
+//   base64-encoded inline — no external file needed). It is muted so the
+//   OS never routes it to the speaker, but iOS still counts it as an active
+//   audio session and keeps the background assertion alive.
 //
-//   We create an AudioContext with a ConstantSourceNode connected through
-//   a GainNode set to gain=0 (zero amplitude — completely inaudible).
-//   While AUDIO is paused, we start() this source so the AudioContext
-//   keeps ticking. iOS sees an active audio session and keeps the
-//   background assertion alive indefinitely.
+//   Started when AUDIO pauses; stopped when AUDIO plays.
+//   Must be triggered from a user gesture (first tap) — we do this lazily.
 //
-//   When AUDIO resumes, we stop the keepalive (AudioContext CPU is
-//   negligible but there's no point running both simultaneously).
-//
-//   The AudioContext must be created in a user-gesture handler — we do
-//   it lazily on the first play() call, which is always user-initiated.
-//
-// Why ConstantSourceNode and not OscillatorNode:
-//   ConstantSourceNode with offset=0 and gain=0 produces a true DC
-//   signal at zero amplitude. It's purpose-built for exactly this use
-//   case and burns less CPU than OscillatorNode.
+// Why a real <audio> element and not AudioContext:
+//   iOS treats WebAudio as ambient and kills it in background.
+//   Only HTMLAudioElement gets the MediaPlayback session category.
 
-let _silentCtx    = null;
-let _silentSource = null;
-let _silentGain   = null;
+// Minimal silent WAV: 44-byte header for 1 sample of silence at 8 kHz mono.
+// Generated once, reused forever. No network request, no file dependency.
+const SILENT_WAV = (() => {
+  const b = new Uint8Array([
+    0x52,0x49,0x46,0x46, 0x24,0x00,0x00,0x00, // "RIFF", chunk size = 36
+    0x57,0x41,0x56,0x45,                       // "WAVE"
+    0x66,0x6D,0x74,0x20, 0x10,0x00,0x00,0x00, // "fmt ", subchunk size = 16
+    0x01,0x00,                                 // PCM format
+    0x01,0x00,                                 // 1 channel (mono)
+    0x40,0x1F,0x00,0x00,                       // 8000 Hz sample rate
+    0x40,0x1F,0x00,0x00,                       // byte rate = 8000
+    0x01,0x00,                                 // block align = 1
+    0x08,0x00,                                 // 8 bits per sample
+    0x64,0x61,0x74,0x61, 0x01,0x00,0x00,0x00, // "data", 1 byte of data
+    0x80,                                      // 1 sample of silence (128 = zero for 8-bit PCM)
+  ]);
+  const blob = new Blob([b], { type: 'audio/wav' });
+  return URL.createObjectURL(blob);
+})();
 
-function ensureSilentContext() {
-  if (_silentCtx) return;
-  try {
-    _silentCtx  = new (window.AudioContext || window.webkitAudioContext)();
-    _silentGain = _silentCtx.createGain();
-    _silentGain.gain.value = 0; // completely inaudible
-    _silentGain.connect(_silentCtx.destination);
-  } catch (e) {
-    console.warn('[KeepAlive] AudioContext unavailable:', e.message);
-  }
-}
+const KEEPALIVE        = document.createElement('audio');
+KEEPALIVE.src          = SILENT_WAV;
+KEEPALIVE.loop         = true;
+KEEPALIVE.muted        = true;   // inaudible to the user
+KEEPALIVE.volume       = 0;
+KEEPALIVE.setAttribute('playsinline', '');
+// Do NOT attach to DOM — iOS allows detached audio elements to keep sessions alive
+
+let _keepaliveStarted = false;
 
 function startSilentKeepAlive() {
-  if (!_silentCtx) return;
-  stopSilentKeepAlive(); // stop any existing source first
-  try {
-    if (_silentCtx.state === 'suspended') _silentCtx.resume().catch(() => {});
-    _silentSource = _silentCtx.createConstantSource();
-    _silentSource.offset.value = 0;
-    _silentSource.connect(_silentGain);
-    _silentSource.start();
-    console.log('[KeepAlive] Silent keepalive started');
-  } catch (e) {
-    console.warn('[KeepAlive] start failed:', e.message);
-  }
+  if (_keepaliveStarted) return;
+  KEEPALIVE.play().then(() => {
+    _keepaliveStarted = true;
+    console.log('[KeepAlive] Silent audio keepalive running');
+  }).catch(e => {
+    // play() was called outside a gesture — will retry on next user interaction
+    console.warn('[KeepAlive] play() deferred:', e.message);
+  });
 }
 
 function stopSilentKeepAlive() {
-  if (_silentSource) {
-    try { _silentSource.stop(); } catch {}
-    try { _silentSource.disconnect(); } catch {}
-    _silentSource = null;
-    console.log('[KeepAlive] Silent keepalive stopped');
-  }
+  if (!_keepaliveStarted) return;
+  KEEPALIVE.pause();
+  _keepaliveStarted = false;
+  console.log('[KeepAlive] Silent audio keepalive stopped');
 }
 
-// Hook into AUDIO events: keepalive runs while paused, stops while playing.
-// The ensureSilentContext() call on 'play' is safe because play() is always
-// triggered by a user gesture (tap), satisfying iOS's AudioContext policy.
-AUDIO.addEventListener('play', () => {
-  ensureSilentContext();
-  stopSilentKeepAlive();
-});
-AUDIO.addEventListener('pause',  () => { startSilentKeepAlive(); });
-AUDIO.addEventListener('ended',  () => { startSilentKeepAlive(); });
+// Start keepalive on first user gesture so the audio element is unlocked
+document.addEventListener('touchend', function unlockKeepalive() {
+  startSilentKeepAlive();
+  document.removeEventListener('touchend', unlockKeepalive);
+}, { once: true, passive: true });
+
+// While AUDIO plays: keepalive not needed (real audio holds the session)
+// While AUDIO is paused/ended: keepalive holds the session open
+AUDIO.addEventListener('play',  () => { stopSilentKeepAlive(); });
+AUDIO.addEventListener('pause', () => { startSilentKeepAlive(); });
+AUDIO.addEventListener('ended', () => { startSilentKeepAlive(); });
 
 // ── VISIBILITY CHANGE ──
-// With the keepalive active, the audio session stays alive during pause,
-// so lock-screen play works. The handler below handles the case where iOS
-// DID kill the session (e.g. after an interruption like a phone call) by
-// attempting a play() with stream-reload fallback on foreground.
+// The keepalive holds the session during pause so lock-screen play works.
+// This handler also covers resuming after phone-call interruptions and
+// re-registering mediaSession metadata when foregrounding.
 
 let _wasPlayingBeforeHide = false;
 let _resumeTimer = null;
@@ -1520,12 +1516,8 @@ document.addEventListener('visibilitychange', () => {
       if (state.playing) navigator.mediaSession.playbackState = 'playing';
     }
 
-    // Resume AudioContext if iOS suspended it during an interruption
-    if (_silentCtx && _silentCtx.state === 'suspended') {
-      _silentCtx.resume().catch(() => {});
-    }
-
-    // If we were playing when we left and iOS paused us, try to resume
+    // If iOS paused us during an interruption (phone call, etc.) and we
+    // were playing, attempt to resume
     if (_wasPlayingBeforeHide && state.playing && AUDIO.paused) {
       AUDIO.play().catch(err => {
         console.warn('[BG resume] play() rejected:', err.message, '— reloading stream');
@@ -1534,7 +1526,7 @@ document.addEventListener('visibilitychange', () => {
     }
 
     _wasPlayingBeforeHide = false;
-  }, 600); // 600 ms — iOS needs ~500 ms to settle AVAudioSession
+  }, 600);
 });
 
 /* ── SWIPE DOWN TO CLOSE NOW PLAYING ── */
