@@ -133,23 +133,14 @@ function onAudioPlay() {
 }
 
 function onAudioPause() {
-  // Always stop the progress RAF and background end timer when audio pauses.
+  // We never call AUDIO.pause() ourselves — this only fires from iOS
+  // system interruptions (phone call, Siri, etc.). Stop the RAF/timer
+  // so we don't burn CPU, but leave state.playing as-is so the
+  // visibility handler knows to resume when we come back.
   if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
   stopBgEndTimer();
-
-  // If state.playing is still true, this pause was triggered by iOS
-  // interrupting the audio session (screen lock with no user intent,
-  // phone call, app switch) — NOT by the user deliberately pausing.
-  // Keep state.playing = true so the visibility-resume logic knows to retry.
-  //
-  // If state.playing is already false, the media session pause handler (or
-  // in-app pause button) already recorded the user's intent — update UI.
-  if (state.playing) return; // iOS-initiated interruption — don't touch UI
-
-  updatePlayIcons(false);
-  artContainer.classList.remove('playing');
-  artContainer.classList.add('paused');
-  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  // Note: do NOT set state.playing = false here — this is a system
+  // interruption, not a user pause. visibility handler will retry play().
 }
 
 function onAudioEnded() {
@@ -158,10 +149,10 @@ function onAudioEnded() {
   stopBgEndTimer();
 
   if (state.repeat === 'one') {
-    // Seek to 0 and replay. This works in foreground. In background the
-    // bgEndTimer fires before this point and handles the seek itself.
+    // Audio is already playing (fake-pause means it never stopped).
+    // Just seek back to the beginning.
     AUDIO.currentTime = 0;
-    AUDIO.play().catch(() => { if (state.currentTrack) loadStreamForTrack(state.currentTrack); });
+    if (state.playing) AUDIO.volume = state.volumeLevel / 100;
     return;
   }
   state.playing = false;
@@ -197,7 +188,9 @@ function startBgEndTimer() {
   _trackStartAudio = AUDIO.currentTime || 0;
 
   _bgEndTimer = setInterval(() => {
-    if (AUDIO.paused || !state.currentDuration) return;
+    // With fake-pause, AUDIO is always "playing" (volume=0 when paused).
+    // Only skip if genuinely paused by iOS interruption.
+    if (!state.currentDuration) return;
 
     // Wall-clock elapsed since track started, offset by where we started.
     const wallElapsed = (Date.now() - _trackStartWall) / 1000;
@@ -210,16 +203,16 @@ function startBgEndTimer() {
     stopBgEndTimer();
 
     if (state.repeat === 'one') {
-      // Seek back to start and keep going — works in background on iOS.
+      // Audio is already playing — just seek back to 0, no play() needed.
       AUDIO.currentTime = 0;
       _trackStartWall  = Date.now();
       _trackStartAudio = 0;
-      AUDIO.play().catch(() => { if (state.currentTrack) loadStreamForTrack(state.currentTrack); });
-      // Restart the timer for the next loop.
+      // If fake-paused, restore volume so the loop is audible
+      if (state.playing) AUDIO.volume = state.volumeLevel / 100;
       startBgEndTimer();
     } else {
-      // For repeat-all / no-repeat, use the existing ended logic.
-      // onAudioEnded will call seekNext() which handles queue advance.
+      // For repeat-all / no-repeat, advance the queue.
+      // Pause first so onAudioEnded doesn't fight the playing element.
       AUDIO.pause();
       onAudioEnded();
     }
@@ -342,9 +335,8 @@ async function loadStreamForTrack(track) {
   }
 
   AUDIO.src = result.url;
-  AUDIO.volume = state.volumeLevel / 100;
-  AUDIO.loop = false; // never rely on native loop — Invidious stream containers
-                      // report 2× real duration so native loop fires at the wrong point.
+  AUDIO.volume = state.volumeLevel / 100; // full volume — a new track always starts audible
+  AUDIO.loop = false;
   AUDIO.load();
   AUDIO.play().catch(e => { console.warn('play() blocked:', e); showLoadingState(false); updatePlayIcons(false); });
 }
@@ -391,15 +383,44 @@ async function playTrack(track, queueOverride, idx) {
 function togglePlayPause() {
   if (!state.currentTrack) return;
   if (state.playing) {
-    state.playing = false; // mark intent BEFORE pause fires onAudioPause
-    AUDIO.pause();
+    iosPause();
   } else {
     if (!AUDIO.src || AUDIO.src === window.location.href) {
       loadStreamForTrack(state.currentTrack);
     } else {
-      AUDIO.play().catch(() => {});
+      iosPlay();
     }
   }
+}
+
+// ── iOS FAKE PAUSE ──
+// We never actually call AUDIO.pause(). Instead we mute the volume to 0
+// so the audio session stays alive — iOS keeps the background assertion
+// only while an audio element is actively playing. A real pause drops the
+// session in ~30 s and then lock-screen resume silently fails forever.
+// iosPlay/iosPause manage the volume and state together.
+function iosPause() {
+  state.playing = false;
+  AUDIO.volume = 0;
+  // bgEndTimer keeps running — AUDIO is still playing silently so the
+  // wall-clock elapsed time continues to advance correctly.
+  // We DO stop the RAF progress loop since the user sees "paused".
+  if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
+  updatePlayIcons(false);
+  artContainer.classList.remove('playing');
+  artContainer.classList.add('paused');
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+}
+
+function iosPlay() {
+  state.playing = true;
+  AUDIO.volume = state.volumeLevel / 100;
+  updatePlayIcons(true);
+  artContainer.classList.remove('paused');
+  artContainer.classList.add('playing');
+  startProgressLoop();
+  // bgEndTimer is already running (audio never stopped), no need to restart
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
 }
 
 function seekPrev() {
@@ -592,7 +613,10 @@ function setupCustomSliders() {
 
     function applyVolume(pct) {
       state.volumeLevel = Math.round(pct * 100);
-      AUDIO.volume = pct;
+      // Only apply volume to AUDIO if actually playing — if fake-paused
+      // (volume=0 to hold iOS session), leave AUDIO.volume at 0 so
+      // the user doesn't accidentally hear audio while "paused"
+      if (state.playing) AUDIO.volume = pct;
       const fill = el('volume-fill'), thumb = el('volume-thumb');
       if (fill) fill.style.width = (pct * 100) + '%';
       if (thumb) thumb.style.left = (pct * 100) + '%';
@@ -625,28 +649,13 @@ function setupMediaSession(track) {
   });
 
   navigator.mediaSession.setActionHandler('play', () => {
-    state.playing = true;
     if (!state.currentTrack) return;
-
-    // iOS lock screen play: just call AUDIO.play() directly.
-    // Do NOT reassign src or call load() — those trigger a network fetch that
-    // iOS blocks while the page is hidden, causing the "plays when I open
-    // the app" symptom. If the audio element already has a src and a buffer,
-    // play() resumes it instantly with no network needed.
-    // Only if there's genuinely no src (first play ever) do we fetch.
-    if (AUDIO.src && AUDIO.src !== window.location.href) {
-      AUDIO.play().catch(() => {
-        // Rejected — stream URL may have truly expired, do a full reload
-        if (state.currentTrack) loadStreamForTrack(state.currentTrack);
-      });
-    } else {
-      loadStreamForTrack(state.currentTrack);
-    }
+    // Audio is already "playing" at volume 0 (fake-paused) — just restore volume
+    iosPlay();
   });
 
   navigator.mediaSession.setActionHandler('pause', () => {
-    state.playing = false;
-    AUDIO.pause();
+    iosPause();
   });
 
   navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
@@ -1462,11 +1471,9 @@ function stopSilentKeepAlive() {
 // below). That pause follows a play() call which is always a user gesture,
 // so KEEPALIVE.play() is allowed at that point.
 
-// While AUDIO plays: keepalive not needed (real audio holds the session)
-// While AUDIO is paused/ended: keepalive holds the session open
-AUDIO.addEventListener('play',  () => { stopSilentKeepAlive(); });
-AUDIO.addEventListener('pause', () => { startSilentKeepAlive(); });
-AUDIO.addEventListener('ended', () => { startSilentKeepAlive(); });
+// AUDIO never actually pauses (we use volume=0 for fake-pause) so the
+// keepalive element is not needed — the main AUDIO element always holds
+// the iOS audio session. These listeners are intentionally removed.
 
 // ── VISIBILITY CHANGE ──
 // The keepalive holds the session during pause so lock-screen play works.
@@ -1493,13 +1500,19 @@ document.addEventListener('visibilitychange', () => {
       if (state.playing) navigator.mediaSession.playbackState = 'playing';
     }
 
-    // If iOS paused us during an interruption (phone call, etc.) and we
-    // were playing, attempt to resume
-    if (_wasPlayingBeforeHide && state.playing && AUDIO.paused) {
+    // If iOS interrupted us (phone call, Siri) and AUDIO actually paused,
+    // resume it. With fake-pause, AUDIO.paused should almost never be true
+    // here — but handle genuine interruptions just in case.
+    if (state.playing && AUDIO.paused) {
       AUDIO.play().catch(err => {
         console.warn('[BG resume] play() rejected:', err.message, '— reloading stream');
         if (state.currentTrack) loadStreamForTrack(state.currentTrack);
       });
+    }
+    // If fake-paused (volume=0 but audio is running), make sure volume stays
+    // at 0 and doesn't accidentally get restored by iOS on foreground.
+    if (!state.playing && !AUDIO.paused) {
+      AUDIO.volume = 0;
     }
 
     _wasPlayingBeforeHide = false;
