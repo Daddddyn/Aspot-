@@ -625,36 +625,22 @@ function setupMediaSession(track) {
   });
 
   navigator.mediaSession.setActionHandler('play', () => {
-    // iOS lock screen "play" quirk:
-    //
-    // Calling AUDIO.play() from the media session play handler while the page
-    // is hidden often silently fails — no rejection, no error, just no audio.
-    // This happens because iOS has partially released the audio element's
-    // network buffer after a pause, and a bare play() call can't restart a
-    // half-dropped remote stream from the background.
-    //
-    // The reliable fix: always do a full src/load/play cycle. The stream URL
-    // comes from streamCache (set during the original load), so there is NO
-    // Invidious fetch — it's purely a local reassignment that gives iOS a
-    // clean starting point. iOS happily starts a fresh network request for a
-    // remote URL from a media session handler even while the page is hidden.
-    state.playing = true; // mark intent before async work
-    if (state.currentTrack) {
-      const cached = streamCache.get(state.currentTrack.videoId);
-      if (cached) {
-        // Fast path: re-assign the cached URL for a clean load
-        const savedTime = AUDIO.currentTime || 0;
-        AUDIO.src = cached.url;
-        AUDIO.load();
-        AUDIO.currentTime = savedTime;
-        AUDIO.play().catch(() => {
-          // URL may have expired — fetch fresh stream
-          loadStreamForTrack(state.currentTrack);
-        });
-      } else {
-        // No cache: fetch a fresh stream (cold start or cache evicted)
-        loadStreamForTrack(state.currentTrack);
-      }
+    state.playing = true;
+    if (!state.currentTrack) return;
+
+    // iOS lock screen play: just call AUDIO.play() directly.
+    // Do NOT reassign src or call load() — those trigger a network fetch that
+    // iOS blocks while the page is hidden, causing the "plays when I open
+    // the app" symptom. If the audio element already has a src and a buffer,
+    // play() resumes it instantly with no network needed.
+    // Only if there's genuinely no src (first play ever) do we fetch.
+    if (AUDIO.src && AUDIO.src !== window.location.href) {
+      AUDIO.play().catch(() => {
+        // Rejected — stream URL may have truly expired, do a full reload
+        if (state.currentTrack) loadStreamForTrack(state.currentTrack);
+      });
+    } else {
+      loadStreamForTrack(state.currentTrack);
     }
   });
 
@@ -1459,31 +1445,22 @@ KEEPALIVE.volume       = 0;
 KEEPALIVE.setAttribute('playsinline', '');
 // Do NOT attach to DOM — iOS allows detached audio elements to keep sessions alive
 
-let _keepaliveStarted = false;
-
 function startSilentKeepAlive() {
-  if (_keepaliveStarted) return;
-  KEEPALIVE.play().then(() => {
-    _keepaliveStarted = true;
-    console.log('[KeepAlive] Silent audio keepalive running');
-  }).catch(e => {
-    // play() was called outside a gesture — will retry on next user interaction
-    console.warn('[KeepAlive] play() deferred:', e.message);
+  if (!KEEPALIVE.paused) return; // already running
+  KEEPALIVE.play().catch(e => {
+    // Blocked outside gesture context — acceptable, will retry on next pause event
+    console.warn('[KeepAlive] play() blocked:', e.message);
   });
 }
 
 function stopSilentKeepAlive() {
-  if (!_keepaliveStarted) return;
+  if (KEEPALIVE.paused) return; // already stopped
   KEEPALIVE.pause();
-  _keepaliveStarted = false;
-  console.log('[KeepAlive] Silent audio keepalive stopped');
 }
 
-// Start keepalive on first user gesture so the audio element is unlocked
-document.addEventListener('touchend', function unlockKeepalive() {
-  startSilentKeepAlive();
-  document.removeEventListener('touchend', unlockKeepalive);
-}, { once: true, passive: true });
+// Keepalive starts automatically when AUDIO first pauses (via the listener
+// below). That pause follows a play() call which is always a user gesture,
+// so KEEPALIVE.play() is allowed at that point.
 
 // While AUDIO plays: keepalive not needed (real audio holds the session)
 // While AUDIO is paused/ended: keepalive holds the session open
