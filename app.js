@@ -137,14 +137,15 @@ function onAudioPause() {
   if (progressRAF) { cancelAnimationFrame(progressRAF); progressRAF = null; }
   stopBgEndTimer();
 
-  // If the page is hidden, this pause was triggered by iOS interrupting the
-  // audio session (screen lock, phone call, app switch) — NOT by the user.
+  // If state.playing is still true, this pause was triggered by iOS
+  // interrupting the audio session (screen lock with no user intent,
+  // phone call, app switch) — NOT by the user deliberately pausing.
   // Keep state.playing = true so the visibility-resume logic knows to retry.
-  // (Intentional lock-screen pauses are handled by the media session handler
-  //  which sets state.playing = false directly before this fires.)
-  if (document.visibilityState === 'hidden') return;
+  //
+  // If state.playing is already false, the media session pause handler (or
+  // in-app pause button) already recorded the user's intent — update UI.
+  if (state.playing) return; // iOS-initiated interruption — don't touch UI
 
-  state.playing = false;
   updatePlayIcons(false);
   artContainer.classList.remove('playing');
   artContainer.classList.add('paused');
@@ -390,6 +391,7 @@ async function playTrack(track, queueOverride, idx) {
 function togglePlayPause() {
   if (!state.currentTrack) return;
   if (state.playing) {
+    state.playing = false; // mark intent BEFORE pause fires onAudioPause
     AUDIO.pause();
   } else {
     if (!AUDIO.src || AUDIO.src === window.location.href) {
@@ -621,24 +623,46 @@ function setupMediaSession(track) {
     title: track.title, artist: track.artist, album: 'Aspotï',
     artwork: track.thumb ? [{ src: track.thumb, sizes: '320x180', type: 'image/jpeg' }, { src: track.thumb, sizes: '640x360', type: 'image/jpeg' }] : [],
   });
+
   navigator.mediaSession.setActionHandler('play', () => {
-    // Called from lock screen / Control Center play button.
-    // AUDIO.play() alone fails silently if the stream URL expired or iOS
-    // dropped the buffer. Try play() first; if it rejects, reload the stream.
-    if (AUDIO.src && AUDIO.src !== window.location.href) {
-      AUDIO.play().catch(() => {
-        if (state.currentTrack) loadStreamForTrack(state.currentTrack);
-      });
-    } else if (state.currentTrack) {
-      loadStreamForTrack(state.currentTrack);
+    // iOS lock screen "play" quirk:
+    //
+    // Calling AUDIO.play() from the media session play handler while the page
+    // is hidden often silently fails — no rejection, no error, just no audio.
+    // This happens because iOS has partially released the audio element's
+    // network buffer after a pause, and a bare play() call can't restart a
+    // half-dropped remote stream from the background.
+    //
+    // The reliable fix: always do a full src/load/play cycle. The stream URL
+    // comes from streamCache (set during the original load), so there is NO
+    // Invidious fetch — it's purely a local reassignment that gives iOS a
+    // clean starting point. iOS happily starts a fresh network request for a
+    // remote URL from a media session handler even while the page is hidden.
+    state.playing = true; // mark intent before async work
+    if (state.currentTrack) {
+      const cached = streamCache.get(state.currentTrack.videoId);
+      if (cached) {
+        // Fast path: re-assign the cached URL for a clean load
+        const savedTime = AUDIO.currentTime || 0;
+        AUDIO.src = cached.url;
+        AUDIO.load();
+        AUDIO.currentTime = savedTime;
+        AUDIO.play().catch(() => {
+          // URL may have expired — fetch fresh stream
+          loadStreamForTrack(state.currentTrack);
+        });
+      } else {
+        // No cache: fetch a fresh stream (cold start or cache evicted)
+        loadStreamForTrack(state.currentTrack);
+      }
     }
   });
+
   navigator.mediaSession.setActionHandler('pause', () => {
-    AUDIO.pause();
-    // Explicitly mark state so visibility-resume logic doesn't fight the
-    // user's intentional pause from the lock screen.
     state.playing = false;
+    AUDIO.pause();
   });
+
   navigator.mediaSession.setActionHandler('previoustrack', () => seekPrev());
   navigator.mediaSession.setActionHandler('nexttrack',     () => seekNext());
   navigator.mediaSession.setActionHandler('seekto', e => { if (state.currentDuration) AUDIO.currentTime = e.seekTime; });
